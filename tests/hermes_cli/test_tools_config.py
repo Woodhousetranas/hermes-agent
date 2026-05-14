@@ -14,6 +14,7 @@ from hermes_cli.tools_config import (
     _reconfigure_provider,
     _get_platform_tools,
     _platform_toolset_summary,
+    _print_tools_list,
     _reconfigure_tool,
     _run_post_setup,
     _save_platform_tools,
@@ -427,6 +428,27 @@ def test_get_platform_tools_no_mcp_sentinel_does_not_affect_other_platforms():
     # cli (not configured with no_mcp) should include MCP
     cli_enabled = _get_platform_tools(config, "cli")
     assert "exa" in cli_enabled
+
+
+def test_print_tools_list_hides_mcp_servers_disabled_by_no_mcp(capsys):
+    """The list output should reflect the effective runtime toolset.
+
+    A platform configured with the ``no_mcp`` sentinel must not show configured
+    MCP servers as enabled; that made Telegram look like it would load
+    gladly-portal even though runtime resolution correctly excluded it.
+    """
+    enabled = {"web", "terminal"}
+    mcp_servers = {
+        "gladly-portal": {"command": "gladly-portal-mcp"},
+        "exa": {"url": "https://mcp.exa.ai/mcp"},
+    }
+
+    _print_tools_list(enabled, mcp_servers, "telegram")
+
+    output = capsys.readouterr().out
+    assert "gladly-portal" not in output
+    assert "exa" not in output
+    assert "MCP servers: none enabled for telegram" in output
 
 
 def test_toolset_has_keys_for_vision_accepts_codex_auth(tmp_path, monkeypatch):

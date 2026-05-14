@@ -3847,10 +3847,18 @@ def _print_tools_list(enabled_toolsets: set, mcp_servers: dict, platform: str = 
                       else color("✗ disabled", Colors.RED))
             print(f"  {status}  {ts_key}  {color(label, Colors.DIM)}")
 
+    enabled_mcp_servers = {
+        srv_name: srv_cfg
+        for srv_name, srv_cfg in mcp_servers.items()
+        if srv_name in enabled_toolsets
+    }
     if mcp_servers:
         print()
+        if not enabled_mcp_servers:
+            print(f"MCP servers: none enabled for {platform}")
+            return
         print("MCP servers:")
-        for srv_name, srv_cfg in mcp_servers.items():
+        for srv_name, srv_cfg in enabled_mcp_servers.items():
             tools_cfg = srv_cfg.get("tools") or {}
             exclude = tools_cfg.get("exclude") or []
             include = tools_cfg.get("include") or []
@@ -3877,7 +3885,7 @@ def tools_disable_enable_command(args):
         return
 
     if action == "list":
-        _print_tools_list(_get_platform_tools(config, platform, include_default_mcp_servers=False),
+        _print_tools_list(_get_platform_tools(config, platform, include_default_mcp_servers=True),
                           config.get("mcp_servers") or {}, platform)
         return
 
