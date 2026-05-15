@@ -218,6 +218,54 @@ class TestGladlyPortalApprovalButtons:
         remaining_state = json.loads((home / "state-snapshots" / "telegram-approval-buttons.json").read_text())
         assert remaining_state["buttons"] == {}
 
+    @pytest.mark.asyncio
+    async def test_wait_button_marks_approval_without_portal_decision(self, tmp_path):
+        adapter = _make_adapter()
+        home = tmp_path / "home"
+        content = f"/gladly_approve {_gladly_token('approval-wait', 'approved')}"
+
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            adapter._extract_gladly_approval_buttons(content)
+            state = json.loads((home / "state-snapshots" / "telegram-approval-buttons.json").read_text())
+            button_id = next(iter(state["buttons"].keys()))
+
+        query = AsyncMock()
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.message.text = "\n".join([
+            "Beslut behövs: Godkänn lösning",
+            "Välj ett alternativ med knapparna nedan.",
+        ])
+        query.message.reply_markup = "existing-buttons"
+        query.from_user = MagicMock()
+        query.from_user.id = "12345"
+        query.from_user.first_name = "Olle"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as spawn:
+                await adapter._handle_gladly_approval_wait_callback(
+                    query,
+                    f"gw:{button_id}",
+                    chat_id=12345,
+                    chat_type="private",
+                    thread_id=None,
+                    user_name="Olle",
+                )
+
+        spawn.assert_not_called()
+        query.answer.assert_awaited_once()
+        assert "ligger kvar" in query.answer.await_args.kwargs["text"]
+        query.edit_message_text.assert_awaited_once()
+        assert query.edit_message_text.await_args.kwargs["reply_markup"] == "existing-buttons"
+        assert "Avvaktar" in query.edit_message_text.await_args.kwargs["text"]
+
+        remaining_state = json.loads((home / "state-snapshots" / "telegram-approval-buttons.json").read_text())
+        assert remaining_state["buttons"][button_id]["deferred_by"] == "Olle"
+        assert remaining_state["buttons"][button_id]["deferred_at"]
+
 
 # ===========================================================================
 # send_exec_approval — inline keyboard buttons
