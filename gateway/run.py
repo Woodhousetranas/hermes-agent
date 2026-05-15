@@ -7503,6 +7503,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # has all API keys in os.environ.
                             from tools.environments.local import _sanitize_subprocess_env
                             sanitized_env = _sanitize_subprocess_env(os.environ.copy())
+                            raw_args = event.get_command_args().strip()
+                            sanitized_env["HERMES_QUICK_COMMAND"] = command
+                            sanitized_env["HERMES_QUICK_COMMAND_ARGS"] = raw_args
+                            sanitized_env["HERMES_QUICK_PLATFORM"] = (
+                                getattr(source.platform, "value", str(source.platform))
+                                if getattr(source, "platform", None) is not None
+                                else ""
+                            )
+                            sanitized_env["HERMES_QUICK_USER_ID"] = str(getattr(source, "user_id", "") or "")
+                            sanitized_env["HERMES_QUICK_CHAT_ID"] = str(getattr(source, "chat_id", "") or "")
+                            sanitized_env["HERMES_QUICK_USER_NAME"] = str(getattr(source, "user_name", "") or "")
                             proc = await asyncio.create_subprocess_shell(
                                 exec_cmd,
                                 stdout=asyncio.subprocess.PIPE,
