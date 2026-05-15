@@ -1,5 +1,7 @@
 """Tests for Telegram inline keyboard approval buttons."""
 
+import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -59,6 +61,19 @@ def _make_adapter(extra=None):
     return adapter
 
 
+def _gladly_token(approval_id: str, decision: str) -> str:
+    payload = {
+        "v": 1,
+        "a": approval_id,
+        "d": decision,
+        "iat": "2026-05-15T08:00:00.000Z",
+        "exp": "2099-05-15T12:00:00.000Z",
+        "n": f"nonce-{decision}",
+    }
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8").hex()
+    return f"hta.v1.h{encoded}.signature"
+
+
 class _AuthRunner:
     """Minimal runner shim for callback auth tests."""
 
@@ -72,6 +87,136 @@ class _AuthRunner:
     def _is_user_authorized(self, source):
         self.last_source = source
         return self.authorized
+
+
+class TestGladlyPortalApprovalButtons:
+    @pytest.mark.asyncio
+    async def test_send_attaches_buttons_and_hides_signed_commands(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=77))
+        home = tmp_path / "home"
+        content = "\n".join([
+            "Beslut behövs: Godkänn lösning",
+            "Kopiera ett helt kommando:",
+            "Godkänn:",
+            f"/gladly_approve {_gladly_token('approval-send', 'approved')}",
+            "Begär ändring:",
+            f"/gladly_change {_gladly_token('approval-send', 'changes_requested')}",
+            "Stoppa:",
+            f"/gladly_stop {_gladly_token('approval-send', 'rejected')}",
+            "Ingen kundkontakt eller publicering görs utan godkännande.",
+        ])
+
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            result = await adapter.send("12345", content, metadata={"notify": True})
+
+        assert result.success is True
+        kwargs = adapter._bot.send_message.call_args.kwargs
+        assert kwargs["reply_markup"] is not None
+        sent_text = kwargs["text"].replace("\\.", ".")
+        assert "/gladly_" not in sent_text
+        assert "hta.v1" not in sent_text
+        assert "Välj ett alternativ med knapparna nedan." in sent_text
+
+    def test_extracts_commands_into_short_telegram_buttons(self, tmp_path):
+        adapter = _make_adapter()
+        home = tmp_path / "home"
+        content = "\n".join([
+            "Beslut behövs: [P1] Godkänn lösning",
+            "Kund A: Ta beslutet i Telegram eller öppna approval i Portalen.",
+            "Risk: Kundsynlig effekt kräver mänskligt beslut.",
+            "Kopiera ett helt kommando:",
+            "",
+            "Godkänn:",
+            f"/gladly_approve {_gladly_token('approval-1', 'approved')}",
+            "",
+            "Begär ändring:",
+            f"/gladly_change {_gladly_token('approval-1', 'changes_requested')}",
+            "",
+            "Stoppa:",
+            f"/gladly_stop {_gladly_token('approval-1', 'rejected')}",
+            "",
+            "Ingen kundkontakt eller publicering görs utan godkännande.",
+        ])
+
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            cleaned, keyboard = adapter._extract_gladly_approval_buttons(content)
+
+        assert keyboard is not None
+        assert "/gladly_" not in cleaned
+        assert "hta.v1" not in cleaned
+        assert "Kopiera ett helt kommando" not in cleaned
+        assert "Välj ett alternativ med knapparna nedan." in cleaned
+
+        state = json.loads((home / "state-snapshots" / "telegram-approval-buttons.json").read_text())
+        entries = list(state["buttons"].values())
+        assert sorted(entry["decision"] for entry in entries) == [
+            "approved",
+            "changes_requested",
+            "rejected",
+        ]
+        assert all(len(entry["id"]) < 20 for entry in entries)
+        assert all(entry["token"].startswith("hta.v1.") for entry in entries)
+
+    @pytest.mark.asyncio
+    async def test_callback_submits_signed_token_to_portal_script(self, tmp_path):
+        adapter = _make_adapter()
+        home = tmp_path / "home"
+        content = f"/gladly_approve {_gladly_token('approval-2', 'approved')}"
+
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            adapter._extract_gladly_approval_buttons(content)
+            state = json.loads((home / "state-snapshots" / "telegram-approval-buttons.json").read_text())
+            button_id, entry = next(iter(state["buttons"].items()))
+
+        query = AsyncMock()
+        query.data = f"ga:{button_id}"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.message.text = "\n".join([
+            "Beslut behövs: Godkänn lösning",
+            "Välj ett alternativ med knapparna nedan.",
+            "Ingen kundkontakt eller publicering görs utan godkännande.",
+        ])
+        query.from_user = MagicMock()
+        query.from_user.id = "12345"
+        query.from_user.first_name = "Olle"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"Beslutet sparades.", b""))
+
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            with patch("tools.environments.local._sanitize_subprocess_env", return_value={}):
+                with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as spawn:
+                    await adapter._handle_gladly_approval_callback(
+                        query,
+                        f"ga:{button_id}",
+                        chat_id=12345,
+                        chat_type="private",
+                        thread_id=None,
+                        user_name="Olle",
+                    )
+
+        spawn.assert_awaited_once()
+        args = spawn.await_args.args
+        kwargs = spawn.await_args.kwargs
+        assert args[:3] == ("bash", str(home / "scripts" / "gladly-telegram-approval-action.sh"), "approved")
+        assert kwargs["env"]["HERMES_QUICK_COMMAND_ARGS"] == entry["token"]
+        assert kwargs["env"]["HERMES_QUICK_PLATFORM"] == "telegram"
+        assert kwargs["env"]["HERMES_QUICK_USER_ID"] == "12345"
+
+        query.edit_message_text.assert_awaited_once()
+        edit_kwargs = query.edit_message_text.await_args.kwargs
+        assert edit_kwargs["reply_markup"] is None
+        assert "Välj ett alternativ" not in edit_kwargs["text"]
+        assert "Beslut: Godkänt i Portalen av Olle." in edit_kwargs["text"]
+
+        remaining_state = json.loads((home / "state-snapshots" / "telegram-approval-buttons.json").read_text())
+        assert remaining_state["buttons"] == {}
 
 
 # ===========================================================================
