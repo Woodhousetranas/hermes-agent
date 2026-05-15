@@ -266,6 +266,28 @@ class TestGladlyPortalApprovalButtons:
         assert remaining_state["buttons"][button_id]["deferred_by"] == "Olle"
         assert remaining_state["buttons"][button_id]["deferred_at"]
 
+    def test_portal_failure_alerts_are_specific(self):
+        adapter = _make_adapter()
+
+        assert (
+            adapter._gladly_approval_failure_message(
+                "[gladly-telegram-approval] Portal bridge svarade 403. status=403"
+            )
+            == "Portalen nekade beslutstoken. Skicka en ny approval-notis."
+        )
+        assert (
+            adapter._gladly_approval_failure_message(
+                "[gladly-telegram-approval] Godkännande saknas. status=404"
+            )
+            == "Godkännandet finns inte längre i Portalen."
+        )
+        assert (
+            adapter._gladly_approval_failure_message(
+                "[gladly-telegram-approval] Approval redan beslutat. status=409"
+            )
+            == "Godkännandet är redan beslutat i Portalen."
+        )
+
 
 # ===========================================================================
 # send_exec_approval — inline keyboard buttons
