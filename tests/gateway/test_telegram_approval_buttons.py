@@ -213,7 +213,7 @@ class TestGladlyPortalApprovalButtons:
         edit_kwargs = query.edit_message_text.await_args.kwargs
         assert edit_kwargs["reply_markup"] is None
         assert "Välj ett alternativ" not in edit_kwargs["text"]
-        assert "Beslut: Godkänt i Portalen av Olle." in edit_kwargs["text"]
+        assert "Beslut: Godkänt av Olle" in edit_kwargs["text"]
 
         remaining_state = json.loads((home / "state-snapshots" / "telegram-approval-buttons.json").read_text())
         assert remaining_state["buttons"] == {}
@@ -248,7 +248,7 @@ class TestGladlyPortalApprovalButtons:
             with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as spawn:
                 await adapter._handle_gladly_approval_wait_callback(
                     query,
-                    f"gw:{button_id}",
+                    f"gw:{button_id}:2h",
                     chat_id=12345,
                     chat_type="private",
                     thread_id=None,
@@ -257,14 +257,100 @@ class TestGladlyPortalApprovalButtons:
 
         spawn.assert_not_called()
         query.answer.assert_awaited_once()
-        assert "ligger kvar" in query.answer.await_args.kwargs["text"]
+        assert "Påminner" in query.answer.await_args.kwargs["text"]
         query.edit_message_text.assert_awaited_once()
         assert query.edit_message_text.await_args.kwargs["reply_markup"] == "existing-buttons"
-        assert "Avvaktar" in query.edit_message_text.await_args.kwargs["text"]
+        assert "Avvaktar 2 timmar" in query.edit_message_text.await_args.kwargs["text"]
 
         remaining_state = json.loads((home / "state-snapshots" / "telegram-approval-buttons.json").read_text())
         assert remaining_state["buttons"][button_id]["deferred_by"] == "Olle"
         assert remaining_state["buttons"][button_id]["deferred_at"]
+        assert remaining_state["buttons"][button_id]["snooze_preset"] == "2h"
+
+        snooze_state = json.loads((home / "state-snapshots" / "telegram-approval-snoozes.json").read_text())
+        assert snooze_state["snoozes"]["approval-wait"]["preset"] == "2h"
+        assert snooze_state["snoozes"]["approval-wait"]["snoozed_until"]
+
+    @pytest.mark.asyncio
+    async def test_change_button_asks_for_comment_then_submits_decision_notes(self, tmp_path):
+        adapter = _make_adapter()
+        home = tmp_path / "home"
+        content = f"/gladly_change {_gladly_token('approval-change', 'changes_requested')}"
+
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            adapter._extract_gladly_approval_buttons(content)
+            state = json.loads((home / "state-snapshots" / "telegram-approval-buttons.json").read_text())
+            button_id, entry = next(iter(state["buttons"].items()))
+
+        query = AsyncMock()
+        query.data = f"ga:{button_id}"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_id = 99
+        query.message.chat.type = "private"
+        query.message.text = "\n".join([
+            "Förslag: Godkänn lösning",
+            "Välj ett alternativ med knapparna nedan.",
+        ])
+        query.message.reply_markup = "existing-buttons"
+        query.from_user = MagicMock()
+        query.from_user.id = "12345"
+        query.from_user.first_name = "Olle"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as spawn:
+                await adapter._handle_gladly_approval_callback(
+                    query,
+                    f"ga:{button_id}",
+                    chat_id=12345,
+                    chat_type="private",
+                    thread_id=None,
+                    user_name="Olle",
+                )
+
+        spawn.assert_not_called()
+        query.answer.assert_awaited_once()
+        assert "Skriv kommentaren" in query.answer.await_args.kwargs["text"]
+        assert "Skriv kort vad du vill ändra" in query.edit_message_text.await_args.kwargs["text"]
+        pending = json.loads((home / "state-snapshots" / "telegram-approval-comments.json").read_text())
+        assert pending["comments"]["12345::12345"]["token"] == entry["token"]
+
+        message = MagicMock()
+        message.text = "Justera källorna innan publicering."
+        message.chat_id = 12345
+        message.chat = MagicMock()
+        message.chat.id = 12345
+        message.message_thread_id = None
+        message.from_user = MagicMock()
+        message.from_user.id = "12345"
+        message.from_user.first_name = "Olle"
+
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"Beslutet sparades.", b""))
+
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            with patch("tools.environments.local._sanitize_subprocess_env", return_value={}):
+                with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as spawn:
+                    handled = await adapter._handle_gladly_approval_comment_message(message)
+
+        assert handled is True
+        spawn.assert_awaited_once()
+        kwargs = spawn.await_args.kwargs
+        assert kwargs["env"]["HERMES_QUICK_COMMAND_ARGS"] == entry["token"]
+        assert kwargs["env"]["HERMES_QUICK_DECISION_NOTES"] == "Justera källorna innan publicering."
+        adapter._bot.edit_message_text.assert_awaited_once()
+        edit_kwargs = adapter._bot.edit_message_text.await_args.kwargs
+        assert edit_kwargs["reply_markup"] is None
+        assert "Beslut: Ändring begärd av Olle" in edit_kwargs["text"]
+        assert "Kommentar: Justera källorna innan publicering." in edit_kwargs["text"]
+
+        remaining_comments = json.loads((home / "state-snapshots" / "telegram-approval-comments.json").read_text())
+        assert remaining_comments["comments"] == {}
+        remaining_buttons = json.loads((home / "state-snapshots" / "telegram-approval-buttons.json").read_text())
+        assert remaining_buttons["buttons"] == {}
 
     def test_portal_failure_alerts_are_specific(self):
         adapter = _make_adapter()
