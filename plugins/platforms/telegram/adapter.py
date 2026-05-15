@@ -743,15 +743,25 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             cleaned_lines.insert(guard_index, hint)
 
-        keyboard = InlineKeyboardMarkup([
-            [
+        decision_buttons = [
+            InlineKeyboardButton(
+                str(entry["label"]),
+                callback_data=f"ga:{entry['id']}",
+            )
+            for entry in entries
+        ]
+        rows = [
+            decision_buttons[:2],
+            decision_buttons[2:],
+        ]
+        if entries:
+            rows[-1].append(
                 InlineKeyboardButton(
-                    str(entry["label"]),
-                    callback_data=f"ga:{entry['id']}",
+                    "Avvakta",
+                    callback_data=f"gw:{entries[0]['id']}",
                 )
-                for entry in entries
-            ]
-        ])
+            )
+        keyboard = InlineKeyboardMarkup([row for row in rows if row])
         return "\n".join(cleaned_lines), keyboard
 
     def _get_gladly_approval_button(self, button_id: str) -> Optional[Dict[str, Any]]:
@@ -775,6 +785,27 @@ class TelegramAdapter(BasePlatformAdapter):
                 state.pop(key, None)
         self._gladly_approval_buttons = state
         self._save_gladly_approval_buttons(state)
+
+    def _mark_gladly_approval_waiting(
+        self,
+        *,
+        button_id: str,
+        approval_id: Optional[str],
+        user_name: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        state = self._load_gladly_approval_buttons()
+        entry = state.get(button_id)
+        if not entry:
+            return None
+        marker = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        for current in state.values():
+            if current is entry or (approval_id and current.get("approval_id") == approval_id):
+                current["deferred_at"] = marker
+                if user_name:
+                    current["deferred_by"] = user_name
+        self._gladly_approval_buttons = state
+        self._save_gladly_approval_buttons(state)
+        return entry
 
     def _is_callback_user_authorized(
         self,
@@ -5256,6 +5287,60 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] Failed to edit Gladly approval message: %s", self.name, exc)
         await query.answer(text=f"{success_text}.")
 
+    async def _handle_gladly_approval_wait_callback(
+        self,
+        query: Any,
+        data: str,
+        *,
+        chat_id: Optional[Any],
+        chat_type: Optional[Any],
+        thread_id: Optional[Any],
+        user_name: Optional[str],
+    ) -> None:
+        button_id = data.split(":", 1)[1].strip()
+        caller_id = str(getattr(getattr(query, "from_user", None), "id", "") or "")
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=str(chat_id) if chat_id is not None else None,
+            chat_type=str(chat_type) if chat_type is not None else None,
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="Du är inte behörig att ta beslut här.", show_alert=True)
+            return
+
+        entry = self._get_gladly_approval_button(button_id)
+        if not entry:
+            await query.answer(text="Beslutet har gått ut eller är redan hanterat.", show_alert=True)
+            return
+
+        approval_id = str(entry.get("approval_id") or "")
+        self._mark_gladly_approval_waiting(
+            button_id=button_id,
+            approval_id=approval_id,
+            user_name=user_name,
+        )
+
+        original_text = str(getattr(getattr(query, "message", None), "text", "") or "").strip()
+        original_lines = [
+            line
+            for line in original_text.splitlines()
+            if not line.strip().startswith("Status: Avvaktar")
+        ]
+        final_text = "\n".join(self._compact_blank_lines(original_lines)).strip()
+        status_line = "Status: Avvaktar. Godkännandet ligger kvar i Portalen."
+        final_text = f"{final_text}\n\n{status_line}" if final_text else status_line
+
+        try:
+            await query.edit_message_text(
+                text=final_text[:4000],
+                parse_mode=None,
+                reply_markup=getattr(getattr(query, "message", None), "reply_markup", None),
+            )
+        except Exception as exc:
+            logger.warning("[%s] Failed to mark Gladly approval as waiting: %s", self.name, exc)
+        await query.answer(text="Okej. Godkännandet ligger kvar i Portalen.")
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -5281,6 +5366,18 @@ class TelegramAdapter(BasePlatformAdapter):
         # --- Gladly Portal approval callbacks (ga:short_id) ---
         if data.startswith("ga:"):
             await self._handle_gladly_approval_callback(
+                query,
+                data,
+                chat_id=query_chat_id,
+                chat_type=query_chat_type,
+                thread_id=query_thread_id,
+                user_name=query_user_name,
+            )
+            return
+
+        # --- Gladly Portal approval wait/snooze callback (gw:short_id) ---
+        if data.startswith("gw:"):
+            await self._handle_gladly_approval_wait_callback(
                 query,
                 data,
                 chat_id=query_chat_id,
