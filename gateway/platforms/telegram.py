@@ -4047,6 +4047,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 pass
         return proc.returncode == 0, output
 
+    @staticmethod
+    def _gladly_approval_failure_message(output: str) -> str:
+        text = (output or "").lower()
+        if "status=403" in text or "signatur" in text or "payload" in text or "token" in text:
+            return "Portalen nekade beslutstoken. Skicka en ny approval-notis."
+        if "status=404" in text or "saknas" in text:
+            return "Godkännandet finns inte längre i Portalen."
+        if "status=409" in text or "redan" in text:
+            return "Godkännandet är redan beslutat i Portalen."
+        if "gått ut" in text or "gatt ut" in text or "expired" in text:
+            return "Beslutet har gått ut. Vänta på en ny approval-notis."
+        if "status=0" in text or "dns" in text or "connect" in text or "timed out" in text:
+            return "Hermes når inte Portalen just nu. Försök igen strax."
+        return "Portalen kunde inte spara beslutet. Kontrollera approval i Portalen."
+
     async def _handle_gladly_approval_callback(
         self,
         query: Any,
@@ -4091,7 +4106,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if not ok:
             logger.warning("[%s] Gladly approval button returned failure: %s", self.name, output)
-            await query.answer(text="Portalen kunde inte ta emot beslutet.", show_alert=True)
+            await query.answer(text=self._gladly_approval_failure_message(output), show_alert=True)
             return
 
         approval_id = str(entry.get("approval_id") or "")
