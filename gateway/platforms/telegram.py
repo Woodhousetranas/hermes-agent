@@ -8,15 +8,18 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+import base64
 import dataclasses
+from datetime import datetime, timezone
 import inspect
 import json
 import logging
 import os
+import secrets
 import tempfile
+import time
 import html as _html
 import re
-from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
 logger = logging.getLogger(__name__)
@@ -103,6 +106,21 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".jpeg": "image/jpeg",
     ".webp": "image/webp",
     ".gif": "image/gif",
+}
+
+_GLADLY_APPROVAL_COMMAND_RE = re.compile(
+    r"^/(gladly_approve|gladly_change|gladly_stop)\s+(hta\.v1\.[^\s]+)\s*$"
+)
+_GLADLY_APPROVAL_LABEL_LINES = {
+    "Godkänn:",
+    "Begär ändring:",
+    "Stoppa:",
+    "Kopiera ett helt kommando:",
+}
+_GLADLY_APPROVAL_DECISIONS = {
+    "gladly_approve": ("approved", "Godkänn", "Godkänt i Portalen."),
+    "gladly_change": ("changes_requested", "Begär ändring", "Ändring begärd i Portalen."),
+    "gladly_stop": ("rejected", "Stoppa", "Stoppat i Portalen."),
 }
 
 
@@ -495,6 +513,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
+        # Gladly approval button state: compact Telegram callback id →
+        # signed Portal decision token. The token remains the authority;
+        # callback_data only carries the short id because Telegram caps it.
+        self._gladly_approval_buttons: Dict[str, Dict[str, Any]] = {}
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
@@ -526,6 +548,218 @@ class TelegramAdapter(BasePlatformAdapter):
         if (metadata or {}).get("notify"):
             return {}
         return {"disable_notification": True}
+
+    def _gladly_approval_state_path(self) -> _Path:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / "state-snapshots" / "telegram-approval-buttons.json"
+
+    @staticmethod
+    def _gladly_approval_payload_from_token(token: str) -> Dict[str, Any]:
+        parts = token.strip().split(".")
+        if len(parts) != 4 or ".".join(parts[:2]) != "hta.v1":
+            raise ValueError("invalid Gladly approval token")
+
+        encoded = parts[2]
+        if encoded.startswith("h"):
+            raw = bytes.fromhex(encoded[1:]).decode("utf-8")
+        else:
+            if encoded.startswith("p"):
+                encoded = encoded[1:]
+            padded = encoded + ("=" * (-len(encoded) % 4))
+            raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        payload = json.loads(raw)
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _gladly_approval_epoch(value: Any) -> Optional[float]:
+        if not value:
+            return None
+        try:
+            text = str(value).strip()
+            if text.endswith("Z"):
+                text = f"{text[:-1]}+00:00"
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except (TypeError, ValueError):
+            return None
+
+    def _load_gladly_approval_buttons(self) -> Dict[str, Dict[str, Any]]:
+        path = self._gladly_approval_state_path()
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            logger.warning("[%s] Failed to read Gladly approval button state: %s", self.name, exc)
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        state = raw.get("buttons", raw)
+        if not isinstance(state, dict):
+            return {}
+        return {
+            str(button_id): entry
+            for button_id, entry in state.items()
+            if isinstance(entry, dict)
+        }
+
+    def _save_gladly_approval_buttons(self, state: Dict[str, Dict[str, Any]]) -> None:
+        path = self._gladly_approval_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent),
+            suffix=".tmp",
+            prefix=".telegram_approval_buttons_",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"buttons": state}, fh, ensure_ascii=False, indent=2, sort_keys=True)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            atomic_replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def _purge_expired_gladly_approval_buttons(
+        self,
+        state: Dict[str, Dict[str, Any]],
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        current = now if now is not None else time.time()
+        expired = [
+            button_id
+            for button_id, entry in state.items()
+            if self._gladly_approval_epoch(entry.get("expires_at")) is not None
+            and self._gladly_approval_epoch(entry.get("expires_at")) <= current
+        ]
+        for button_id in expired:
+            state.pop(button_id, None)
+        return bool(expired)
+
+    def _register_gladly_approval_button(self, command_name: str, token: str) -> Dict[str, Any]:
+        decision, label, success_text = _GLADLY_APPROVAL_DECISIONS[command_name]
+        payload = self._gladly_approval_payload_from_token(token)
+        state = self._load_gladly_approval_buttons()
+        self._purge_expired_gladly_approval_buttons(state)
+
+        for _ in range(10):
+            button_id = secrets.token_urlsafe(8)
+            if button_id not in state:
+                break
+        else:
+            raise RuntimeError("could not allocate Gladly approval callback id")
+
+        entry = {
+            "id": button_id,
+            "token": token,
+            "decision": decision,
+            "label": label,
+            "success_text": success_text,
+            "approval_id": str(payload.get("a") or ""),
+            "expires_at": str(payload.get("exp") or ""),
+            "created_at": time.time(),
+        }
+        state[button_id] = entry
+        self._gladly_approval_buttons = state
+        self._save_gladly_approval_buttons(state)
+        return entry
+
+    @staticmethod
+    def _compact_blank_lines(lines: List[str]) -> List[str]:
+        compacted: List[str] = []
+        for line in lines:
+            if not line.strip() and (not compacted or not compacted[-1].strip()):
+                continue
+            compacted.append(line)
+        while compacted and not compacted[-1].strip():
+            compacted.pop()
+        return compacted
+
+    def _extract_gladly_approval_buttons(
+        self,
+        content: str,
+    ) -> tuple[str, Optional["InlineKeyboardMarkup"]]:
+        matches = [
+            _GLADLY_APPROVAL_COMMAND_RE.match(line.strip())
+            for line in content.splitlines()
+        ]
+        command_matches = [match for match in matches if match]
+        if not command_matches:
+            return content, None
+
+        entries: List[Dict[str, Any]] = []
+        seen_decisions: set[str] = set()
+        for match in command_matches:
+            command_name, token = match.group(1), match.group(2)
+            decision = _GLADLY_APPROVAL_DECISIONS[command_name][0]
+            if decision in seen_decisions:
+                continue
+            entries.append(self._register_gladly_approval_button(command_name, token))
+            seen_decisions.add(decision)
+
+        cleaned_lines: List[str] = []
+        for line in content.splitlines():
+            stripped = line.strip()
+            if _GLADLY_APPROVAL_COMMAND_RE.match(stripped):
+                continue
+            if stripped in _GLADLY_APPROVAL_LABEL_LINES:
+                continue
+            cleaned_lines.append(line)
+
+        cleaned_lines = self._compact_blank_lines(cleaned_lines)
+        hint = "Välj ett alternativ med knapparna nedan."
+        if hint not in "\n".join(cleaned_lines):
+            guard_index = next(
+                (
+                    index
+                    for index, line in enumerate(cleaned_lines)
+                    if "Ingen kundkontakt" in line
+                ),
+                len(cleaned_lines),
+            )
+            cleaned_lines.insert(guard_index, hint)
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    str(entry["label"]),
+                    callback_data=f"ga:{entry['id']}",
+                )
+                for entry in entries
+            ]
+        ])
+        return "\n".join(cleaned_lines), keyboard
+
+    def _get_gladly_approval_button(self, button_id: str) -> Optional[Dict[str, Any]]:
+        state = self._load_gladly_approval_buttons()
+        changed = self._purge_expired_gladly_approval_buttons(state)
+        entry = state.get(button_id)
+        if changed:
+            self._save_gladly_approval_buttons(state)
+        self._gladly_approval_buttons = state
+        return entry
+
+    def _remove_gladly_approval_buttons(
+        self,
+        *,
+        button_id: str,
+        approval_id: Optional[str],
+    ) -> None:
+        state = self._load_gladly_approval_buttons()
+        for key, entry in list(state.items()):
+            if key == button_id or (approval_id and entry.get("approval_id") == approval_id):
+                state.pop(key, None)
+        self._gladly_approval_buttons = state
+        self._save_gladly_approval_buttons(state)
 
     def _is_callback_user_authorized(
         self,
@@ -2205,12 +2439,23 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         
         try:
+            gladly_reply_markup = None
+            try:
+                content, gladly_reply_markup = self._extract_gladly_approval_buttons(content)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Failed to prepare Gladly approval buttons; sending text fallback: %s",
+                    self.name,
+                    exc,
+                    exc_info=True,
+                )
+
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(content, metadata=metadata):
+            if gladly_reply_markup is None and self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
@@ -2286,6 +2531,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         error=self._dm_topic_missing_anchor_error(),
                         retryable=False,
                     )
+                reply_markup = gladly_reply_markup if i == 0 else None
                 thread_kwargs = self._thread_kwargs_for_send(
                     chat_id,
                     thread_id,
@@ -2308,6 +2554,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 text=chunk,
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
+                                reply_markup=reply_markup,
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
@@ -2322,6 +2569,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     text=plain_chunk,
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
+                                    reply_markup=reply_markup,
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
@@ -3725,6 +3973,121 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+    async def _run_gladly_approval_button(
+        self,
+        entry: Dict[str, Any],
+        *,
+        query: Any,
+        chat_id: Optional[Any],
+        user_name: Optional[str],
+    ) -> tuple[bool, str]:
+        from hermes_constants import get_hermes_home
+        from tools.environments.local import _sanitize_subprocess_env
+
+        home = get_hermes_home()
+        script = home / "scripts" / "gladly-telegram-approval-action.sh"
+        env = _sanitize_subprocess_env(os.environ.copy())
+        env["HERMES_HOME"] = str(home)
+        env["HERMES_QUICK_COMMAND_ARGS"] = str(entry.get("token") or "")
+        env["HERMES_QUICK_PLATFORM"] = "telegram"
+        env["HERMES_QUICK_USER_ID"] = str(getattr(getattr(query, "from_user", None), "id", "") or "")
+        env["HERMES_QUICK_CHAT_ID"] = str(chat_id or "")
+        env["HERMES_QUICK_USER_NAME"] = str(user_name or "")
+
+        proc = await asyncio.create_subprocess_exec(
+            "bash",
+            str(script),
+            str(entry.get("decision") or ""),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        output = ((stdout or b"") + (b"\n" if stdout and stderr else b"") + (stderr or b"")).decode(
+            "utf-8",
+            errors="replace",
+        ).strip()
+        if output:
+            try:
+                from agent.redact import redact_sensitive_text
+
+                output = redact_sensitive_text(output)
+            except Exception:
+                pass
+        return proc.returncode == 0, output
+
+    async def _handle_gladly_approval_callback(
+        self,
+        query: Any,
+        data: str,
+        *,
+        chat_id: Optional[Any],
+        chat_type: Optional[Any],
+        thread_id: Optional[Any],
+        user_name: Optional[str],
+    ) -> None:
+        button_id = data.split(":", 1)[1].strip()
+        caller_id = str(getattr(getattr(query, "from_user", None), "id", "") or "")
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=str(chat_id) if chat_id is not None else None,
+            chat_type=str(chat_type) if chat_type is not None else None,
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="Du är inte behörig att ta beslut här.", show_alert=True)
+            return
+
+        entry = self._get_gladly_approval_button(button_id)
+        if not entry:
+            await query.answer(text="Beslutet har gått ut eller är redan hanterat.", show_alert=True)
+            return
+
+        try:
+            ok, output = await self._run_gladly_approval_button(
+                entry,
+                query=query,
+                chat_id=chat_id,
+                user_name=user_name,
+            )
+        except asyncio.TimeoutError:
+            await query.answer(text="Portalen svarade inte i tid. Försök igen.", show_alert=True)
+            return
+        except Exception as exc:
+            logger.error("[%s] Gladly approval button failed: %s", self.name, exc, exc_info=True)
+            await query.answer(text="Kunde inte skicka beslutet till Portalen.", show_alert=True)
+            return
+
+        if not ok:
+            logger.warning("[%s] Gladly approval button returned failure: %s", self.name, output)
+            await query.answer(text="Portalen kunde inte ta emot beslutet.", show_alert=True)
+            return
+
+        approval_id = str(entry.get("approval_id") or "")
+        self._remove_gladly_approval_buttons(button_id=button_id, approval_id=approval_id)
+
+        success_text = str(entry.get("success_text") or "Beslutet är sparat i Portalen.").rstrip(".")
+        actor = str(user_name or "Telegram").strip()
+        original_text = str(getattr(getattr(query, "message", None), "text", "") or "").strip()
+        original_lines = [
+            line
+            for line in original_text.splitlines()
+            if line.strip() != "Välj ett alternativ med knapparna nedan."
+        ]
+        final_text = "\n".join(self._compact_blank_lines(original_lines)).strip()
+        decision_line = f"Beslut: {success_text} av {actor}."
+        final_text = f"{final_text}\n\n{decision_line}" if final_text else decision_line
+
+        try:
+            await query.edit_message_text(
+                text=final_text[:4000],
+                parse_mode=None,
+                reply_markup=None,
+            )
+        except Exception as exc:
+            logger.warning("[%s] Failed to edit Gladly approval message: %s", self.name, exc)
+        await query.answer(text=f"{success_text}.")
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -3745,6 +4108,18 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
+            return
+
+        # --- Gladly Portal approval callbacks (ga:short_id) ---
+        if data.startswith("ga:"):
+            await self._handle_gladly_approval_callback(
+                query,
+                data,
+                chat_id=query_chat_id,
+                chat_type=query_chat_type,
+                thread_id=query_thread_id,
+                user_name=query_user_name,
+            )
             return
 
         # --- Gmail-triage callbacks (gt:verb:arg) ---
