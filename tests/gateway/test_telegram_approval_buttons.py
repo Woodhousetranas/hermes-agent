@@ -158,6 +158,34 @@ class TestGladlyPortalApprovalButtons:
         assert all(len(entry["id"]) < 20 for entry in entries)
         assert all(entry["token"].startswith("hta.v1.") for entry in entries)
 
+    def test_new_approval_notice_invalidates_previous_buttons_for_same_approval(self, tmp_path):
+        adapter = _make_adapter()
+        home = tmp_path / "home"
+        first_content = "\n".join([
+            f"/gladly_approve {_gladly_token('approval-repeat', 'approved')}",
+            f"/gladly_change {_gladly_token('approval-repeat', 'changes_requested')}",
+            f"/gladly_stop {_gladly_token('approval-repeat', 'rejected')}",
+        ])
+        second_content = "\n".join([
+            "Påminnelse: beslut behövs.",
+            f"/gladly_approve {_gladly_token('approval-repeat', 'approved')}",
+            f"/gladly_change {_gladly_token('approval-repeat', 'changes_requested')}",
+            f"/gladly_stop {_gladly_token('approval-repeat', 'rejected')}",
+        ])
+
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            adapter._extract_gladly_approval_buttons(first_content)
+            first_state = json.loads((home / "state-snapshots" / "telegram-approval-buttons.json").read_text())
+            first_ids = set(first_state["buttons"].keys())
+
+            adapter._extract_gladly_approval_buttons(second_content)
+            second_state = json.loads((home / "state-snapshots" / "telegram-approval-buttons.json").read_text())
+
+        assert len(first_ids) == 3
+        assert len(second_state["buttons"]) == 3
+        assert first_ids.isdisjoint(second_state["buttons"].keys())
+        assert {entry["approval_id"] for entry in second_state["buttons"].values()} == {"approval-repeat"}
+
     @pytest.mark.asyncio
     async def test_callback_submits_signed_token_to_portal_script(self, tmp_path):
         adapter = _make_adapter()
@@ -219,7 +247,104 @@ class TestGladlyPortalApprovalButtons:
         assert remaining_state["buttons"] == {}
 
     @pytest.mark.asyncio
-    async def test_wait_button_marks_approval_without_portal_decision(self, tmp_path):
+    async def test_callback_409_clears_stale_buttons_without_error_alert(self, tmp_path):
+        adapter = _make_adapter()
+        home = tmp_path / "home"
+        content = "\n".join([
+            f"/gladly_approve {_gladly_token('approval-stale', 'approved')}",
+            f"/gladly_change {_gladly_token('approval-stale', 'changes_requested')}",
+            f"/gladly_stop {_gladly_token('approval-stale', 'rejected')}",
+        ])
+
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            adapter._extract_gladly_approval_buttons(content)
+            state = json.loads((home / "state-snapshots" / "telegram-approval-buttons.json").read_text())
+            button_id = next(
+                item_id
+                for item_id, item in state["buttons"].items()
+                if item["decision"] == "approved"
+            )
+
+        query = AsyncMock()
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.message.text = "\n".join([
+            "Beslut behövs: Godkänn lösning",
+            "Välj ett alternativ med knapparna nedan.",
+        ])
+        query.from_user = MagicMock()
+        query.from_user.id = "12345"
+        query.from_user.first_name = "Olle"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        proc = MagicMock()
+        proc.returncode = 1
+        proc.communicate = AsyncMock(return_value=(b"", b"[gladly-telegram-approval] Approval redan beslutat. status=409"))
+
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            with patch("tools.environments.local._sanitize_subprocess_env", return_value={}):
+                with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
+                    await adapter._handle_gladly_approval_callback(
+                        query,
+                        f"ga:{button_id}",
+                        chat_id=12345,
+                        chat_type="private",
+                        thread_id=None,
+                        user_name="Olle",
+                    )
+
+        query.answer.assert_awaited_once()
+        assert query.answer.await_args.kwargs["text"] == "Redan hanterat i Portalen."
+        assert query.answer.await_args.kwargs.get("show_alert") is not True
+        query.edit_message_text.assert_awaited_once()
+        edit_kwargs = query.edit_message_text.await_args.kwargs
+        assert edit_kwargs["reply_markup"] is None
+        assert "Välj ett alternativ" not in edit_kwargs["text"]
+        assert "Status: Godkännandet är redan hanterat i Portalen." in edit_kwargs["text"]
+
+        remaining_state = json.loads((home / "state-snapshots" / "telegram-approval-buttons.json").read_text())
+        assert remaining_state["buttons"] == {}
+
+    @pytest.mark.asyncio
+    async def test_missing_button_removes_markup_from_stale_message(self, tmp_path):
+        adapter = _make_adapter()
+        home = tmp_path / "home"
+
+        query = AsyncMock()
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.message.text = "\n".join([
+            "Beslut behövs: Godkänn lösning",
+            "Välj ett alternativ med knapparna nedan.",
+        ])
+        query.from_user = MagicMock()
+        query.from_user.id = "12345"
+        query.from_user.first_name = "Olle"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            await adapter._handle_gladly_approval_callback(
+                query,
+                "ga:missing-button",
+                chat_id=12345,
+                chat_type="private",
+                thread_id=None,
+                user_name="Olle",
+            )
+
+        query.answer.assert_awaited_once()
+        assert query.answer.await_args.kwargs["text"] == "Beslutet har gått ut eller är redan hanterat."
+        query.edit_message_text.assert_awaited_once()
+        edit_kwargs = query.edit_message_text.await_args.kwargs
+        assert edit_kwargs["reply_markup"] is None
+        assert "Status: Godkännandet är redan hanterat i Portalen." in edit_kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_wait_button_snoozes_approval_in_portal_without_decision(self, tmp_path):
         adapter = _make_adapter()
         home = tmp_path / "home"
         content = f"/gladly_approve {_gladly_token('approval-wait', 'approved')}"
@@ -244,18 +369,29 @@ class TestGladlyPortalApprovalButtons:
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
 
-        with patch("hermes_constants.get_hermes_home", return_value=home):
-            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as spawn:
-                await adapter._handle_gladly_approval_wait_callback(
-                    query,
-                    f"gw:{button_id}:2h",
-                    chat_id=12345,
-                    chat_type="private",
-                    thread_id=None,
-                    user_name="Olle",
-                )
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b'{"ok":true}', b""))
 
-        spawn.assert_not_called()
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            with patch("tools.environments.local._sanitize_subprocess_env", return_value={}):
+                with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as spawn:
+                    await adapter._handle_gladly_approval_wait_callback(
+                        query,
+                        f"gw:{button_id}:2h",
+                        chat_id=12345,
+                        chat_type="private",
+                        thread_id=None,
+                        user_name="Olle",
+                    )
+
+        spawn.assert_awaited_once()
+        args = spawn.await_args.args
+        kwargs = spawn.await_args.kwargs
+        assert args[:3] == ("bash", str(home / "scripts" / "gladly-telegram-approval-snooze.sh"), "approval-wait")
+        assert args[3] == "--until"
+        assert str(args[4]).endswith("Z")
+        assert kwargs["env"]["HERMES_QUICK_PLATFORM"] == "telegram"
         query.answer.assert_awaited_once()
         assert "Påminner" in query.answer.await_args.kwargs["text"]
         query.edit_message_text.assert_awaited_once()
@@ -270,6 +406,102 @@ class TestGladlyPortalApprovalButtons:
         snooze_state = json.loads((home / "state-snapshots" / "telegram-approval-snoozes.json").read_text())
         assert snooze_state["snoozes"]["approval-wait"]["preset"] == "2h"
         assert snooze_state["snoozes"]["approval-wait"]["snoozed_until"]
+
+    @pytest.mark.asyncio
+    async def test_wait_button_clears_stale_buttons_when_portal_says_not_pending(self, tmp_path):
+        adapter = _make_adapter()
+        home = tmp_path / "home"
+        content = f"/gladly_approve {_gladly_token('approval-wait-stale', 'approved')}"
+
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            adapter._extract_gladly_approval_buttons(content)
+            state = json.loads((home / "state-snapshots" / "telegram-approval-buttons.json").read_text())
+            button_id = next(iter(state["buttons"].keys()))
+
+        query = AsyncMock()
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.message.text = "\n".join([
+            "Beslut behövs: Godkänn lösning",
+            "Välj ett alternativ med knapparna nedan.",
+        ])
+        query.message.reply_markup = "existing-buttons"
+        query.from_user = MagicMock()
+        query.from_user.id = "12345"
+        query.from_user.first_name = "Olle"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        proc = MagicMock()
+        proc.returncode = 1
+        proc.communicate = AsyncMock(return_value=(
+            b"",
+            "status=404 Approval hittades inte eller är inte i 'pending'-status.".encode("utf-8"),
+        ))
+
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            with patch("tools.environments.local._sanitize_subprocess_env", return_value={}):
+                with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
+                    await adapter._handle_gladly_approval_wait_callback(
+                        query,
+                        f"gw:{button_id}:2h",
+                        chat_id=12345,
+                        chat_type="private",
+                        thread_id=None,
+                        user_name="Olle",
+                    )
+
+        query.answer.assert_awaited_once()
+        assert query.answer.await_args.kwargs["text"] == "Redan hanterat i Portalen."
+        query.edit_message_text.assert_awaited_once()
+        assert query.edit_message_text.await_args.kwargs["reply_markup"] is None
+        remaining_state = json.loads((home / "state-snapshots" / "telegram-approval-buttons.json").read_text())
+        assert remaining_state["buttons"] == {}
+
+    @pytest.mark.asyncio
+    async def test_wait_button_does_not_update_local_snooze_when_portal_fails(self, tmp_path):
+        adapter = _make_adapter()
+        home = tmp_path / "home"
+        content = f"/gladly_approve {_gladly_token('approval-wait-fail', 'approved')}"
+
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            adapter._extract_gladly_approval_buttons(content)
+            state = json.loads((home / "state-snapshots" / "telegram-approval-buttons.json").read_text())
+            button_id = next(iter(state["buttons"].keys()))
+
+        query = AsyncMock()
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.message.text = "Beslut behövs"
+        query.message.reply_markup = "existing-buttons"
+        query.from_user = MagicMock()
+        query.from_user.id = "12345"
+        query.from_user.first_name = "Olle"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        proc = MagicMock()
+        proc.returncode = 1
+        proc.communicate = AsyncMock(return_value=(b"", b"status=0 connect timed out"))
+
+        with patch("hermes_constants.get_hermes_home", return_value=home):
+            with patch("tools.environments.local._sanitize_subprocess_env", return_value={}):
+                with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
+                    await adapter._handle_gladly_approval_wait_callback(
+                        query,
+                        f"gw:{button_id}:2h",
+                        chat_id=12345,
+                        chat_type="private",
+                        thread_id=None,
+                        user_name="Olle",
+                    )
+
+        query.answer.assert_awaited_once()
+        assert "Hermes når inte Portalen" in query.answer.await_args.kwargs["text"]
+        query.edit_message_text.assert_not_awaited()
+        assert not (home / "state-snapshots" / "telegram-approval-snoozes.json").exists()
 
     @pytest.mark.asyncio
     async def test_change_button_asks_for_comment_then_submits_decision_notes(self, tmp_path):
