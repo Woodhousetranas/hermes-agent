@@ -815,6 +815,16 @@ class TelegramAdapter(BasePlatformAdapter):
         entries: List[Dict[str, Any]] = []
         seen_decisions: set[str] = set()
         portal_url = self._gladly_approval_portal_url(content)
+        approval_ids: set[str] = set()
+        for match in command_matches:
+            try:
+                payload = self._gladly_approval_payload_from_token(match.group(2))
+                approval_id = str(payload.get("a") or "").strip()
+                if approval_id:
+                    approval_ids.add(approval_id)
+            except Exception:
+                continue
+        self._remove_gladly_approval_buttons_for_approval_ids(approval_ids)
         for match in command_matches:
             command_name, token = match.group(1), match.group(2)
             decision = _GLADLY_APPROVAL_DECISIONS[command_name][0]
@@ -898,6 +908,16 @@ class TelegramAdapter(BasePlatformAdapter):
         self._gladly_approval_buttons = state
         self._save_gladly_approval_buttons(state)
 
+    def _remove_gladly_approval_buttons_for_approval_ids(self, approval_ids: set[str]) -> None:
+        if not approval_ids:
+            return
+        state = self._load_gladly_approval_buttons()
+        for key, entry in list(state.items()):
+            if str(entry.get("approval_id") or "") in approval_ids:
+                state.pop(key, None)
+        self._gladly_approval_buttons = state
+        self._save_gladly_approval_buttons(state)
+
     def _mark_gladly_approval_waiting(
         self,
         *,
@@ -905,13 +925,15 @@ class TelegramAdapter(BasePlatformAdapter):
         approval_id: Optional[str],
         user_name: Optional[str],
         preset: str = "30m",
+        snoozed_until: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         state = self._load_gladly_approval_buttons()
         entry = state.get(button_id)
         if not entry:
             return None
         marker = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        label, snoozed_until = self._gladly_approval_snooze_until(preset)
+        label, computed_snoozed_until = self._gladly_approval_snooze_until(preset)
+        snoozed_until = snoozed_until or computed_snoozed_until
         for current in state.values():
             if current is entry or (approval_id and current.get("approval_id") == approval_id):
                 current["deferred_at"] = marker
@@ -5402,6 +5424,60 @@ class TelegramAdapter(BasePlatformAdapter):
                 pass
         return proc.returncode == 0, output
 
+    async def _run_gladly_approval_snooze(
+        self,
+        entry: Dict[str, Any],
+        *,
+        query: Any,
+        chat_id: Optional[Any],
+        user_name: Optional[str],
+        until: str,
+    ) -> tuple[bool, str]:
+        from hermes_constants import get_hermes_home
+        from tools.environments.local import _sanitize_subprocess_env
+
+        home = get_hermes_home()
+        script = home / "scripts" / "gladly-telegram-approval-snooze.sh"
+        env = _sanitize_subprocess_env(os.environ.copy())
+        env["HERMES_HOME"] = str(home)
+        env["HERMES_QUICK_PLATFORM"] = "telegram"
+        env["HERMES_QUICK_USER_ID"] = str(getattr(getattr(query, "from_user", None), "id", "") or "")
+        env["HERMES_QUICK_CHAT_ID"] = str(chat_id or "")
+        env["HERMES_QUICK_USER_NAME"] = str(user_name or "")
+
+        proc = await asyncio.create_subprocess_exec(
+            "bash",
+            str(script),
+            str(entry.get("approval_id") or ""),
+            "--until",
+            until,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        output = ((stdout or b"") + (b"\n" if stdout and stderr else b"") + (stderr or b"")).decode(
+            "utf-8",
+            errors="replace",
+        ).strip()
+        if output:
+            try:
+                from agent.redact import redact_sensitive_text
+
+                output = redact_sensitive_text(output)
+            except Exception:
+                pass
+        return proc.returncode == 0, output
+
+    @staticmethod
+    def _gladly_approval_failure_is_resolved(output: str) -> bool:
+        text = (output or "").lower()
+        if "status=409" in text or "redan" in text:
+            return True
+        if "status=404" in text and ("pending" in text or "saknas" in text or "inte längre" in text):
+            return True
+        return False
+
     @staticmethod
     def _gladly_approval_failure_message(output: str) -> str:
         text = (output or "").lower()
@@ -5416,6 +5492,39 @@ class TelegramAdapter(BasePlatformAdapter):
         if "status=0" in text or "dns" in text or "connect" in text or "timed out" in text:
             return "Hermes når inte Portalen just nu. Försök igen strax."
         return "Portalen kunde inte spara beslutet. Kontrollera approval i Portalen."
+
+    def _gladly_approval_status_text(self, original_text: str, status_line: str) -> str:
+        ignored = {
+            "Välj ett alternativ med knapparna nedan.",
+            "Skriv kort vad du vill ändra. Jag sparar kommentaren i Portalen.",
+        }
+        original_lines = [
+            line
+            for line in original_text.splitlines()
+            if line.strip() not in ignored
+            and not line.strip().startswith("Status:")
+            and not line.strip().startswith("Beslut:")
+            and not line.strip().startswith("Kommentar:")
+        ]
+        final_lines = self._compact_blank_lines(original_lines)
+        final_lines.append("")
+        final_lines.append(status_line)
+        return "\n".join(self._compact_blank_lines(final_lines)).strip()
+
+    async def _mark_gladly_approval_message_resolved(self, query: Any) -> None:
+        original_text = str(getattr(getattr(query, "message", None), "text", "") or "").strip()
+        final_text = self._gladly_approval_status_text(
+            original_text,
+            "Status: Godkännandet är redan hanterat i Portalen.",
+        )
+        try:
+            await query.edit_message_text(
+                text=final_text[:4000],
+                parse_mode=None,
+                reply_markup=None,
+            )
+        except Exception as exc:
+            logger.warning("[%s] Failed to mark stale Gladly approval message: %s", self.name, exc)
 
     @staticmethod
     def _gladly_approval_receipt_label(entry: Dict[str, Any]) -> str:
@@ -5491,7 +5600,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         entry = self._get_gladly_approval_button(button_id)
         if not entry:
-            await query.answer(text="Beslutet har gått ut eller är redan hanterat.", show_alert=True)
+            await self._mark_gladly_approval_message_resolved(query)
+            await query.answer(text="Beslutet har gått ut eller är redan hanterat.")
             return
 
         if str(entry.get("decision") or "") == "changes_requested":
@@ -5539,6 +5649,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if not ok:
             logger.warning("[%s] Gladly approval button returned failure: %s", self.name, output)
+            if self._gladly_approval_failure_is_resolved(output):
+                approval_id = str(entry.get("approval_id") or "")
+                self._remove_gladly_approval_buttons(button_id=button_id, approval_id=approval_id)
+                await self._mark_gladly_approval_message_resolved(query)
+                await query.answer(text="Redan hanterat i Portalen.")
+                return
             await query.answer(text=self._gladly_approval_failure_message(output), show_alert=True)
             return
 
@@ -5584,19 +5700,48 @@ class TelegramAdapter(BasePlatformAdapter):
 
         entry = self._get_gladly_approval_button(button_id)
         if not entry:
-            await query.answer(text="Beslutet har gått ut eller är redan hanterat.", show_alert=True)
+            await self._mark_gladly_approval_message_resolved(query)
+            await query.answer(text="Beslutet har gått ut eller är redan hanterat.")
             return
 
         approval_id = str(entry.get("approval_id") or "")
+        label, snoozed_until = self._gladly_approval_snooze_until(preset)
+        try:
+            ok, output = await self._run_gladly_approval_snooze(
+                entry,
+                query=query,
+                chat_id=chat_id,
+                user_name=user_name,
+                until=snoozed_until,
+            )
+        except asyncio.TimeoutError:
+            await query.answer(text="Portalen svarade inte i tid. Försök igen.", show_alert=True)
+            return
+        except Exception as exc:
+            logger.error("[%s] Gladly approval snooze failed: %s", self.name, exc, exc_info=True)
+            await query.answer(text="Kunde inte pausa påminnelsen i Portalen.", show_alert=True)
+            return
+
+        if not ok:
+            logger.warning("[%s] Gladly approval snooze returned failure: %s", self.name, output)
+            if self._gladly_approval_failure_is_resolved(output):
+                self._remove_gladly_approval_buttons(button_id=button_id, approval_id=approval_id)
+                await self._mark_gladly_approval_message_resolved(query)
+                await query.answer(text="Redan hanterat i Portalen.")
+                return
+            await query.answer(text=self._gladly_approval_failure_message(output), show_alert=True)
+            return
+
         marked = self._mark_gladly_approval_waiting(
             button_id=button_id,
             approval_id=approval_id,
             user_name=user_name,
             preset=preset,
+            snoozed_until=snoozed_until,
         )
         snoozed_until = str((marked or entry).get("snoozed_until") or "")
         snooze_label = str((marked or entry).get("snooze_preset") or preset)
-        label = _GLADLY_APPROVAL_SNOOZE_PRESETS.get(snooze_label, (snooze_label, None))[0]
+        label = _GLADLY_APPROVAL_SNOOZE_PRESETS.get(snooze_label, (label, None))[0]
 
         original_text = str(getattr(getattr(query, "message", None), "text", "") or "").strip()
         original_lines = [
@@ -5667,6 +5812,27 @@ class TelegramAdapter(BasePlatformAdapter):
             ok, output = False, str(exc)
 
         if not ok:
+            if self._gladly_approval_failure_is_resolved(output):
+                approval_id = str(entry.get("approval_id") or "")
+                self._remove_gladly_approval_buttons(button_id=str(entry.get("id") or ""), approval_id=approval_id)
+                message_id_text = str(entry.get("message_id") or "").strip()
+                if self._bot and chat_id is not None and message_id_text:
+                    try:
+                        await self._bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=int(message_id_text),
+                            text=self._gladly_approval_status_text(
+                                str(entry.get("original_text") or ""),
+                                "Status: Godkännandet är redan hanterat i Portalen.",
+                            )[:4000],
+                            parse_mode=None,
+                            reply_markup=None,
+                        )
+                    except Exception as exc:
+                        logger.warning("[%s] Failed to edit stale Gladly approval comment message: %s", self.name, exc)
+                if self._bot and chat_id is not None:
+                    await self._bot.send_message(chat_id=chat_id, text="Redan hanterat i Portalen.")
+                return True
             state = self._load_gladly_approval_comment_state()
             state[key] = entry
             self._save_gladly_approval_comment_state(state)
