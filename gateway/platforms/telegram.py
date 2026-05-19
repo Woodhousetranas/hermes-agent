@@ -11,6 +11,8 @@ import asyncio
 import base64
 import dataclasses
 from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
 import inspect
 import json
 import logging
@@ -588,6 +590,32 @@ class TelegramAdapter(BasePlatformAdapter):
         payload = json.loads(raw)
         return payload if isinstance(payload, dict) else {}
 
+    @classmethod
+    def _gladly_approval_verified_payload_from_token(cls, token: str) -> Dict[str, Any]:
+        parts = token.strip().split(".")
+        if len(parts) != 4 or ".".join(parts[:2]) != "hta.v1":
+            raise ValueError("invalid Gladly approval token")
+
+        secret = (
+            os.getenv("HERMES_TELEGRAM_APPROVAL_SECRET", "").strip()
+            or os.getenv("GLADLY_TELEGRAM_APPROVAL_SECRET", "").strip()
+        )
+        if not secret:
+            raise ValueError("missing Gladly approval token secret")
+
+        signed_part = ".".join(parts[:3])
+        expected = hmac.new(secret.encode("utf-8"), signed_part.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(parts[3] or "", expected):
+            raise ValueError("invalid Gladly approval token signature")
+
+        payload = cls._gladly_approval_payload_from_token(token)
+        expires_at = cls._gladly_approval_epoch(payload.get("exp"))
+        if expires_at is None:
+            raise ValueError("invalid Gladly approval token expiry")
+        if expires_at <= time.time():
+            raise ValueError("expired Gladly approval token")
+        return payload
+
     @staticmethod
     def _gladly_approval_epoch(value: Any) -> Optional[float]:
         if not value:
@@ -800,23 +828,21 @@ class TelegramAdapter(BasePlatformAdapter):
         entries: List[Dict[str, Any]] = []
         seen_decisions: set[str] = set()
         portal_url = self._gladly_approval_portal_url(content)
-        approval_ids: set[str] = set()
-        for match in command_matches:
-            try:
-                payload = self._gladly_approval_payload_from_token(match.group(2))
-                approval_id = str(payload.get("a") or "").strip()
-                if approval_id:
-                    approval_ids.add(approval_id)
-            except Exception:
-                continue
-        self._remove_gladly_approval_buttons_for_approval_ids(approval_ids)
         for match in command_matches:
             command_name, token = match.group(1), match.group(2)
             decision = _GLADLY_APPROVAL_DECISIONS[command_name][0]
             if decision in seen_decisions:
                 continue
-            entries.append(self._register_gladly_approval_button(command_name, token, portal_url=portal_url))
+            try:
+                self._gladly_approval_verified_payload_from_token(token)
+                entries.append(self._register_gladly_approval_button(command_name, token, portal_url=portal_url))
+            except Exception as exc:
+                logger.warning("[%s] Ignoring invalid Gladly approval command token: %s", self.name, exc)
+                continue
             seen_decisions.add(decision)
+
+        if not entries:
+            return content, None
 
         cleaned_lines: List[str] = []
         for line in content.splitlines():
@@ -958,6 +984,18 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _save_gladly_approval_comment_state(self, state: Dict[str, Dict[str, Any]]) -> None:
         self._save_gladly_json_state(self._gladly_approval_comment_state_path(), "comments", state)
+
+    def _clear_gladly_approval_comment_pending_for_approval_id(self, approval_id: Optional[str]) -> None:
+        if not approval_id:
+            return
+        state = self._load_gladly_approval_comment_state()
+        changed = False
+        for key, entry in list(state.items()):
+            if str(entry.get("approval_id") or "") == str(approval_id):
+                state.pop(key, None)
+                changed = True
+        if changed:
+            self._save_gladly_approval_comment_state(state)
 
     def _set_gladly_approval_comment_pending(
         self,
@@ -4457,7 +4495,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.edit_message_text(
                     text=final_text[:4000],
                     parse_mode=None,
-                    reply_markup=getattr(getattr(query, "message", None), "reply_markup", None),
+                    reply_markup=None,
                 )
             except Exception as exc:
                 logger.warning("[%s] Failed to mark Gladly approval comment prompt: %s", self.name, exc)
@@ -4465,6 +4503,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         try:
+            self._clear_gladly_approval_comment_pending_for_approval_id(str(entry.get("approval_id") or ""))
             ok, output = await self._run_gladly_approval_button(
                 entry,
                 query=query,
@@ -4504,6 +4543,11 @@ class TelegramAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.warning("[%s] Failed to edit Gladly approval message: %s", self.name, exc)
+            if self._bot and chat_id is not None:
+                try:
+                    await self._bot.send_message(chat_id=chat_id, text=final_text[:4000])
+                except Exception as send_exc:
+                    logger.warning("[%s] Failed to send Gladly approval fallback receipt: %s", self.name, send_exc)
         await query.answer(text=f"{self._gladly_approval_receipt_label(entry)} i Portalen.")
 
     async def _handle_gladly_approval_wait_callback(
@@ -4539,6 +4583,7 @@ class TelegramAdapter(BasePlatformAdapter):
         approval_id = str(entry.get("approval_id") or "")
         label, snoozed_until = self._gladly_approval_snooze_until(preset)
         try:
+            self._clear_gladly_approval_comment_pending_for_approval_id(approval_id)
             ok, output = await self._run_gladly_approval_snooze(
                 entry,
                 query=query,
