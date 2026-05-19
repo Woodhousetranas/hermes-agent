@@ -185,7 +185,9 @@ class TestGladlyPortalApprovalButtons:
             cleaned, keyboard = adapter._extract_gladly_approval_buttons(content)
 
         assert keyboard is None
-        assert cleaned == content
+        assert "/gladly_" not in cleaned
+        assert "hta.v1" not in cleaned
+        assert "Knappar kunde inte skapas" in cleaned
         assert not (home / "state-snapshots" / "telegram-approval-buttons.json").exists()
 
         monkeypatch.delenv("HERMES_TELEGRAM_APPROVAL_SECRET", raising=False)
@@ -193,7 +195,9 @@ class TestGladlyPortalApprovalButtons:
             cleaned, keyboard = adapter._extract_gladly_approval_buttons(f"/gladly_approve {token}")
 
         assert keyboard is None
-        assert cleaned == f"/gladly_approve {token}"
+        assert "/gladly_" not in cleaned
+        assert "hta.v1" not in cleaned
+        assert "Knappar kunde inte skapas" in cleaned
 
     def test_new_approval_notice_keeps_previous_buttons_for_same_approval(self, tmp_path):
         adapter = _make_adapter()
