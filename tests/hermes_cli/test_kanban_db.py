@@ -2261,6 +2261,60 @@ def test_session_id_index_exists(kanban_home):
     assert "idx_tasks_session_id" in names
 
 
+def test_legacy_board_without_session_id_migrates_before_index(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    db_path = home / "kanban.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                body TEXT,
+                assignee TEXT,
+                status TEXT NOT NULL,
+                priority INTEGER DEFAULT 0,
+                created_by TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+                workspace_path TEXT,
+                branch_name TEXT,
+                claim_lock TEXT,
+                claim_expires INTEGER,
+                tenant TEXT,
+                result TEXT,
+                idempotency_key TEXT,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                worker_pid INTEGER,
+                last_failure_error TEXT,
+                max_runtime_seconds INTEGER,
+                last_heartbeat_at INTEGER,
+                current_run_id INTEGER,
+                workflow_template_id TEXT,
+                current_step_key TEXT,
+                skills TEXT,
+                model_override TEXT,
+                max_retries INTEGER
+            )
+            """
+        )
+
+    with kb.connect() as conn:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND tbl_name='tasks'"
+        ).fetchall()
+
+    assert "session_id" in cols
+    assert "idx_tasks_session_id" in {row["name"] for row in rows}
+
+
 def test_session_id_compose_with_tenant_filter(kanban_home):
     """A client may want both `tenant=scarf:foo` AND `session=acp-x` —
     the filters must AND, not replace."""
