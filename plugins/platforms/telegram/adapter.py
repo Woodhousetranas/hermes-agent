@@ -856,9 +856,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 continue
             seen_decisions.add(decision)
 
-        if not entries:
-            return content, None
-
         cleaned_lines: List[str] = []
         for line in content.splitlines():
             stripped = line.strip()
@@ -869,6 +866,20 @@ class TelegramAdapter(BasePlatformAdapter):
             cleaned_lines.append(line)
 
         cleaned_lines = self._compact_blank_lines(cleaned_lines)
+        if not entries:
+            fallback = "Knappar kunde inte skapas. Öppna approval i Portalen."
+            if fallback not in "\n".join(cleaned_lines):
+                guard_index = next(
+                    (
+                        index
+                        for index, line in enumerate(cleaned_lines)
+                        if "Ingen kundkontakt" in line
+                    ),
+                    len(cleaned_lines),
+                )
+                cleaned_lines.insert(guard_index, fallback)
+            return "\n".join(cleaned_lines), None
+
         hint = "Välj ett alternativ med knapparna nedan."
         if hint not in "\n".join(cleaned_lines):
             guard_index = next(
