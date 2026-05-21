@@ -3144,6 +3144,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 delivery_error = str(de)
                 logger.error("Delivery failed for job %s: %s", job["id"], de)
 
+        confirm_script = str(job.get("delivery_confirm_script") or "").strip()
+        if should_deliver and delivery_error is None and confirm_script:
+            confirm_ok, confirm_output = _run_job_script(confirm_script)
+            if not confirm_ok:
+                delivery_error = f"delivery confirm script failed: {confirm_output}"
+                logger.error("Delivery confirm failed for job %s: %s", job["id"], confirm_output)
+
         # Treat empty final_response as a soft failure so last_status
         # is not "ok" — the agent ran but produced nothing useful.
         # (issue #8585)

@@ -2540,6 +2540,61 @@ class TestSilentDelivery:
             tick(verbose=False)
         deliver_mock.assert_called_once()
 
+    def test_delivery_confirm_script_runs_after_successful_delivery(self):
+        job = {
+            **self._make_job(),
+            "delivery_confirm_script": "confirm.sh",
+        }
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "notify", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler._run_job_script", return_value=(True, "")) as confirm_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        confirm_mock.assert_called_once_with("confirm.sh")
+        mark_mock.assert_called_once_with("monitor-job", True, None, delivery_error=None)
+
+    def test_delivery_confirm_script_does_not_run_after_failed_delivery(self):
+        job = {
+            **self._make_job(),
+            "delivery_confirm_script": "confirm.sh",
+        }
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "notify", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value="telegram down"), \
+             patch("cron.scheduler._run_job_script") as confirm_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        confirm_mock.assert_not_called()
+        mark_mock.assert_called_once_with("monitor-job", True, None, delivery_error="telegram down")
+
+    def test_delivery_confirm_failure_is_tracked_as_delivery_error(self):
+        job = {
+            **self._make_job(),
+            "delivery_confirm_script": "confirm.sh",
+        }
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "notify", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler._run_job_script", return_value=(False, "no pending state")), \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        mark_mock.assert_called_once_with(
+            "monitor-job",
+            True,
+            None,
+            delivery_error="delivery confirm script failed: no pending state",
+        )
+
     def test_output_saved_even_when_delivery_suppressed(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# full output", "[SILENT]", None)), \
