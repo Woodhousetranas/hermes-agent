@@ -191,9 +191,47 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
         collected_output_items: list = []
+        codex_iter_recovered = False
         try:
             with active_client.responses.stream(**api_kwargs) as stream:
-                for event in stream:
+                # Codex backend (chatgpt.com/backend-api/codex) occasionally
+                # emits a response.completed event with `response.output =
+                # None` instead of `[]`. The OpenAI SDK's internal
+                # parse_response unconditionally does `for output in
+                # response.output:` and raises TypeError. Catch the
+                # specific shape during stream iteration so we can recover
+                # using the deltas + output_item.done items we collected
+                # ourselves (we never get to stream.get_final_response()
+                # because the iterator itself died).
+                try:
+                    stream_iter = iter(stream)
+                except TypeError:
+                    raise
+                while True:
+                    try:
+                        event = next(stream_iter)
+                    except StopIteration:
+                        break
+                    except TypeError as _codex_iter_err:
+                        if "NoneType" in str(_codex_iter_err) and (
+                            collected_output_items or agent._codex_streamed_text_parts
+                        ):
+                            logger.warning(
+                                "Codex Responses SDK threw TypeError(NoneType) during "
+                                "stream iteration; recovering from %d collected items + "
+                                "%d text deltas. %s",
+                                len(collected_output_items),
+                                len(agent._codex_streamed_text_parts),
+                                agent._client_log_context(),
+                            )
+                            # Skip stream.get_final_response() — SDK never
+                            # finished parsing the completion event so
+                            # _completed_response is None and get_final_response()
+                            # asserts. Build a synthetic Response from what we
+                            # collected directly.
+                            codex_iter_recovered = True
+                            break
+                        raise
                     agent._touch_activity("receiving stream response")
                     if agent._interrupt_requested:
                         break
@@ -240,7 +278,20 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                             sum(len(p) for p in agent._codex_streamed_text_parts),
                             agent._client_log_context(),
                         )
-                final_response = stream.get_final_response()
+                if codex_iter_recovered:
+                    # SDK iterator died before yielding response.completed
+                    # (response.output was None). Synthesize a minimal
+                    # Response object from what we collected; the existing
+                    # post-loop patch below will fill output from items or
+                    # streamed deltas.
+                    final_response = SimpleNamespace(
+                        output=[],
+                        output_text="".join(agent._codex_streamed_text_parts),
+                        status="completed",
+                        error=None,
+                    )
+                else:
+                    final_response = stream.get_final_response()
                 # PATCH: ChatGPT Codex backend streams valid output items
                 # but get_final_response() can return an empty output list.
                 # Backfill from collected items or synthesize from deltas.
