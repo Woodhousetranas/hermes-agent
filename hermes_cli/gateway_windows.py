@@ -345,7 +345,7 @@ def _build_gateway_cmd_script(
 
     The script:
       - cd's into a stable working directory
-      - exports HERMES_HOME, PYTHONIOENCODING, VIRTUAL_ENV
+      - exports HERMES_HOME, UTF-8 locale/Python flags, VIRTUAL_ENV
       - invokes ``pythonw -m hermes_cli.main [--profile X] gateway run``
         directly so the wrapper cmd.exe exits without a visible gateway console
 
@@ -356,6 +356,9 @@ def _build_gateway_cmd_script(
     lines = ["@echo off", f"rem {_TASK_DESCRIPTION}"]
     lines.append(f"cd /d {_quote_cmd_script_arg(working_dir)}")
     lines.append(f'set "HERMES_HOME={hermes_home}"')
+    lines.append('set "LANG=C.UTF-8"')
+    lines.append('set "LC_ALL=C.UTF-8"')
+    lines.append('set "PYTHONUTF8=1"')
     lines.append('set "PYTHONIOENCODING=utf-8"')
     lines.append('set "HERMES_GATEWAY_DETACHED=1"')
     # VIRTUAL_ENV lets the gateway's own python detection find the venv
@@ -377,6 +380,20 @@ def _build_gateway_cmd_script(
     lines.append(" ".join(_quote_cmd_script_arg(a) for a in prog_args))
     lines.append("exit /b 0")
     return "\r\n".join(lines) + "\r\n"
+
+
+def _resolve_gateway_working_dir(project_root: Path, hermes_home: str) -> str:
+    """Resolve the cwd used by Windows service-managed gateway starts."""
+    override = os.environ.get("HERMES_GATEWAY_WORKING_DIR", "").strip()
+    if override:
+        return str(Path(override).expanduser().resolve())
+
+    home_path = Path(hermes_home).resolve()
+    parent = home_path.parent
+    if home_path.name.lower() == "home" and (parent / "hermes-agent").exists():
+        return str(parent)
+
+    return _stable_gateway_working_dir(project_root)
 
 
 def _build_startup_launcher(script_path: Path) -> str:
@@ -416,8 +433,8 @@ def _write_task_script() -> Path:
     )
 
     python_path = get_python_path()
-    working_dir = _stable_gateway_working_dir(PROJECT_ROOT)
     hermes_home = str(Path(get_hermes_home()).resolve())
+    working_dir = _resolve_gateway_working_dir(PROJECT_ROOT, hermes_home)
     profile_arg = _profile_arg(hermes_home)
 
     content = _build_gateway_cmd_script(python_path, working_dir, hermes_home, profile_arg)
@@ -586,8 +603,8 @@ def _build_gateway_argv() -> tuple[list[str], str, dict[str, str]]:
 
     python_exe, venv_dir, extra_pythonpath = _resolve_detached_python(get_python_path())
     project_root = str(PROJECT_ROOT)
-    working_dir = _stable_gateway_working_dir(PROJECT_ROOT)
     hermes_home = str(Path(get_hermes_home()).resolve())
+    working_dir = _resolve_gateway_working_dir(PROJECT_ROOT, hermes_home)
     profile_arg = _profile_arg(hermes_home)
 
     argv = [python_exe, "-m", "hermes_cli.main"]
@@ -597,6 +614,9 @@ def _build_gateway_argv() -> tuple[list[str], str, dict[str, str]]:
 
     env_overlay = {
         "HERMES_HOME": hermes_home,
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONUTF8": "1",
         "PYTHONIOENCODING": "utf-8",
         "HERMES_GATEWAY_DETACHED": "1",
         "VIRTUAL_ENV": str(venv_dir),

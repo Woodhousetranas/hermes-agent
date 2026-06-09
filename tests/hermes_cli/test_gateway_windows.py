@@ -107,6 +107,10 @@ def test_build_gateway_argv_uses_base_pythonw_for_uv_venv_launcher(monkeypatch, 
 
     assert argv[:3] == [str(base_pythonw), "-m", "hermes_cli.main"]
     assert cwd == str(hermes_home.resolve())
+    assert env_overlay["LANG"] == "C.UTF-8"
+    assert env_overlay["LC_ALL"] == "C.UTF-8"
+    assert env_overlay["PYTHONUTF8"] == "1"
+    assert env_overlay["PYTHONIOENCODING"] == "utf-8"
     assert env_overlay["VIRTUAL_ENV"] == str(project / "venv")
     assert str(project) in env_overlay["PYTHONPATH"].split(gateway_windows.os.pathsep)
     assert str(site_packages) in env_overlay["PYTHONPATH"].split(gateway_windows.os.pathsep)
@@ -204,6 +208,62 @@ def test_gateway_cmd_script_uses_pythonw_without_replace_or_start_churn(monkeypa
     assert "--replace" not in content
     assert "start \"\"" not in content
     assert "exit /b 0" in content
+
+
+def test_gateway_cmd_script_forces_utf8_environment(monkeypatch):
+    """Scheduled Task starts must force UTF-8 for cron subprocess decoding."""
+    content = gateway_windows._build_gateway_cmd_script(
+        r"C:\\Hermes\\hermes-agent\\venv\\Scripts\\python.exe",
+        r"C:\\Hermes",
+        r"C:\\Hermes\\home",
+        "",
+    )
+
+    assert 'set "LANG=C.UTF-8"' in content
+    assert 'set "LC_ALL=C.UTF-8"' in content
+    assert 'set "PYTHONUTF8=1"' in content
+    assert 'set "PYTHONIOENCODING=utf-8"' in content
+
+
+def test_resolve_gateway_working_dir_honors_env_override(monkeypatch, tmp_path):
+    project = tmp_path / "hermes-agent"
+    repo_root = tmp_path / "Gladly-Hermes"
+    repo_root.mkdir()
+    monkeypatch.setenv("HERMES_GATEWAY_WORKING_DIR", str(repo_root))
+
+    assert gateway_windows._resolve_gateway_working_dir(project, str(tmp_path / "home")) == str(repo_root.resolve())
+
+
+def test_resolve_gateway_working_dir_uses_embedded_repo_parent(monkeypatch, tmp_path):
+    project = tmp_path / "Gladly-Hermes" / "hermes-agent"
+    hermes_home = tmp_path / "Gladly-Hermes" / "home"
+    project.mkdir(parents=True)
+    hermes_home.mkdir()
+    monkeypatch.delenv("HERMES_GATEWAY_WORKING_DIR", raising=False)
+
+    assert gateway_windows._resolve_gateway_working_dir(project, str(hermes_home)) == str(hermes_home.parent.resolve())
+
+
+def test_exec_schtasks_replaces_undecodable_localized_output(monkeypatch):
+    calls = []
+
+    class Result:
+        returncode = 1
+        stdout = ""
+        stderr = "ERROR"
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Result()
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows.shutil, "which", lambda name: "schtasks.exe")
+    monkeypatch.setattr(gateway_windows.subprocess, "run", fake_run)
+
+    gateway_windows._exec_schtasks(["/Query", "/TN", "Hermes_Gateway"])
+
+    assert calls[0][1]["text"] is True
+    assert calls[0][1]["errors"] == "replace"
 
 
 def test_elevated_gateway_command_uses_pythonw_hidden_console(monkeypatch):
