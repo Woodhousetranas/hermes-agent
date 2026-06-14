@@ -273,6 +273,8 @@ def _platform_asset_name() -> str:
                 ["ldd", "--version"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=2,
                 stdin=subprocess.DEVNULL,
             )
@@ -525,6 +527,8 @@ def _run_bws_list(
             env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=_BWS_RUN_TIMEOUT,
             stdin=subprocess.DEVNULL,
         )

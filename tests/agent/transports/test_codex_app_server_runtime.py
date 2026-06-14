@@ -7,6 +7,9 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
+import os
+import sys
+
 import pytest
 
 from hermes_cli.runtime_provider import (
@@ -133,6 +136,31 @@ class TestCodexAppServerModule:
         ok, msg = check_codex_binary(codex_bin="/nonexistent/codex/binary/path")
         assert ok is False
         assert "not found" in msg.lower() or "no such" in msg.lower()
+
+    def test_check_binary_replaces_non_utf8_version_output(self, tmp_path) -> None:
+        from agent.transports.codex_app_server import check_codex_binary
+
+        if os.name == "nt":
+            codex = tmp_path / "codex.cmd"
+            codex.write_text(
+                f'@"{sys.executable}" -c "import sys; '
+                'sys.stdout.buffer.write(b\'codex-cli 0.130.0 \\\\xf6\\\\n\')" %*\n',
+                encoding="utf-8",
+            )
+        else:
+            codex = tmp_path / "codex"
+            codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "sys.stdout.buffer.write(b'codex-cli 0.130.0 \\xf6\\n')\n",
+                encoding="utf-8",
+            )
+            codex.chmod(0o755)
+
+        ok, msg = check_codex_binary(codex_bin=str(codex))
+
+        assert ok is True
+        assert msg == "0.130.0"
 
     def test_codex_error_class_is_runtimeerror(self) -> None:
         from agent.transports.codex_app_server import CodexAppServerError
