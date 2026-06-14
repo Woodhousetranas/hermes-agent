@@ -377,6 +377,8 @@ def check_codex_binary(
             [codex_bin, "--version"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             stdin=subprocess.DEVNULL,
         )
@@ -387,6 +389,8 @@ def check_codex_binary(
         )
     except subprocess.TimeoutExpired:
         return False, "codex --version timed out"
+    except OSError as exc:
+        return False, f"codex CLI could not be executed at {codex_bin!r}: {exc}"
     if proc.returncode != 0:
         return False, f"codex --version exited {proc.returncode}: {proc.stderr.strip()}"
     version = parse_codex_version(proc.stdout)
