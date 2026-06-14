@@ -321,6 +321,22 @@ def test_run_job_script_python_still_runs_via_python(hermes_env):
     assert output.startswith("python ")
 
 
+def test_run_job_script_replaces_invalid_utf8_output(hermes_env):
+    """Windows children can emit non-UTF-8 bytes; capture must not crash."""
+    from cron.scheduler import _run_job_script
+
+    script_path = hermes_env / "scripts" / "cp1252.py"
+    script_path.write_text(
+        "import sys\n"
+        "sys.stdout.buffer.write(b'provider-k\\xf6rning stopped\\n')\n"
+    )
+
+    ok, output = _run_job_script("cp1252.py")
+    assert ok is True
+    assert "provider-k" in output
+    assert "rning stopped" in output
+
+
 def test_run_job_script_path_traversal_still_blocked(hermes_env):
     """Security regression: shell-script support must NOT loosen containment."""
     from cron.scheduler import _run_job_script
