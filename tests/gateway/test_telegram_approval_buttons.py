@@ -88,6 +88,7 @@ def _gladly_token(approval_id: str, decision: str) -> str:
 @pytest.fixture(autouse=True)
 def _gladly_approval_secret(monkeypatch):
     monkeypatch.setenv("HERMES_TELEGRAM_APPROVAL_SECRET", _GLADLY_APPROVAL_TEST_SECRET)
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "*")
 
 
 class _AuthRunner:
