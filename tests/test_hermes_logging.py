@@ -764,6 +764,7 @@ class TestAddRotatingHandler:
                 logger.removeHandler(h)
                 h.close()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX chmod bits are not meaningful on Windows")
     def test_managed_mode_initial_open_sets_group_writable(self, tmp_path):
         log_path = tmp_path / "managed-open.log"
         logger = logging.getLogger("_test_rotating_managed_open")
@@ -788,6 +789,7 @@ class TestAddRotatingHandler:
                 logger.removeHandler(h)
                 h.close()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX chmod bits are not meaningful on Windows")
     def test_managed_mode_rollover_sets_group_writable(self, tmp_path):
         log_path = tmp_path / "managed-rollover.log"
         logger = logging.getLogger("_test_rotating_managed_rollover")
@@ -955,6 +957,7 @@ class TestExternalRotationRecovery:
         handler.emit(record)
         handler.flush()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="Windows locks open log files instead of allowing external rename")
     def test_recovers_after_external_rename(self, tmp_path):
         """logrotate-style external rename: ``mv gateway.log gateway.log.1``.
 
@@ -983,6 +986,7 @@ class TestExternalRotationRecovery:
         finally:
             handler.close()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="Windows locks open log files instead of allowing external unlink")
     def test_recovers_after_external_unlink(self, tmp_path):
         """``rm gateway.log`` then keep writing — handler recreates the file."""
         log_path = tmp_path / "gateway.log"
@@ -1053,6 +1057,38 @@ class TestExternalRotationRecovery:
         finally:
             handler.close()
 
+    def test_locked_windows_rollover_is_deferred_without_traceback(self, tmp_path):
+        """Windows can reject rotation while another process holds the log."""
+        log_path = tmp_path / "agent.log"
+        handler = hermes_logging._ManagedRotatingFileHandler(
+            str(log_path), maxBytes=1, backupCount=1, encoding="utf-8",
+        )
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        rotate_calls = 0
+
+        def locked_rotate(_source, _dest):
+            nonlocal rotate_calls
+            rotate_calls += 1
+            raise PermissionError(13, "file is locked by another process")
+
+        handler.rotate = locked_rotate
+        try:
+            with patch.object(handler, "handleError") as handle_error:
+                self._emit(handler, "first record")
+                self._emit(handler, "second record")
+                self._emit(handler, "third record")
+
+            handle_error.assert_not_called()
+            assert rotate_calls == 1
+            content = log_path.read_text()
+            assert "first record" in content
+            assert "second record" in content
+            assert "third record" in content
+        finally:
+            handler.close()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Windows locks open log files instead of allowing external rename")
     def test_gateway_log_attached_after_external_rotation_then_re_setup(
         self, hermes_home,
     ):

@@ -3599,10 +3599,12 @@ def _sync_codex_pool_entries(
     refresh_token = tokens.get("refresh_token")
     pool = auth_store.get("credential_pool")
     if not isinstance(pool, dict):
-        return
+        pool = {}
+        auth_store["credential_pool"] = pool
     entries = pool.get("openai-codex")
     if not isinstance(entries, list):
-        return
+        entries = []
+        pool["openai-codex"] = entries
     # Previous singleton access_token (before this re-auth overwrote it) —
     # used to distinguish legacy singleton-aliases from independent accounts.
     # When None or empty, no manual entry can be treated as an alias (which
@@ -3611,12 +3613,14 @@ def _sync_codex_pool_entries(
     prev_at = None
     if isinstance(previous_singleton_tokens, dict):
         prev_at = previous_singleton_tokens.get("access_token") or None
+    saw_device_code_entry = False
     for entry in entries:
         if not isinstance(entry, dict):
             continue
         source = entry.get("source")
         if source == "device_code":
             # Singleton-seeded mirror — always refresh.
+            saw_device_code_entry = True
             refresh_this_entry = True
         elif source == "manual:device_code":
             # Refresh only if this entry's existing access_token matches the
@@ -3643,6 +3647,26 @@ def _sync_codex_pool_entries(
         entry["last_error_reason"] = None
         entry["last_error_message"] = None
         entry["last_error_reset_at"] = None
+    if not saw_device_code_entry:
+        seeded_entry = {
+            "id": uuid.uuid4().hex[:6],
+            "label": "openai-codex-oauth",
+            "source": "device_code",
+            "auth_type": "oauth",
+            "priority": 0,
+            "access_token": access_token,
+            "last_status": None,
+            "last_status_at": None,
+            "last_error_code": None,
+            "last_error_reason": None,
+            "last_error_message": None,
+            "last_error_reset_at": None,
+        }
+        if refresh_token:
+            seeded_entry["refresh_token"] = refresh_token
+        if last_refresh:
+            seeded_entry["last_refresh"] = last_refresh
+        entries.insert(0, seeded_entry)
 
 
 def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
@@ -3971,6 +3995,25 @@ def resolve_codex_runtime_credentials(
                 code=CODEX_RATE_LIMITED_CODE,
                 relogin_required=False,
             )
+        if (
+            read_error is not None
+            and getattr(read_error, "relogin_required", False)
+            and getattr(read_error, "code", None) == "codex_auth_missing"
+        ):
+            imported = _recover_codex_tokens_from_cli("codex_auth_missing")
+            if imported:
+                base_url = (
+                    os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+                    or DEFAULT_CODEX_BASE_URL
+                )
+                return {
+                    "provider": "openai-codex",
+                    "base_url": base_url,
+                    "api_key": str(imported.get("access_token", "")).strip(),
+                    "source": "hermes-auth-store",
+                    "last_refresh": imported.get("last_refresh"),
+                    "auth_mode": "chatgpt",
+                }
         if read_error is not None:
             raise read_error
         raise AuthError(
@@ -4116,10 +4159,16 @@ def _pool_codex_access_token() -> str:
             token = entry.get("access_token")
             if not isinstance(token, str) or not token.strip():
                 return False
+            status = str(entry.get("last_status") or "").strip().lower()
+            if status == "dead":
+                return False
             # Skip entries currently in an exhaustion cooldown window.
             reset_at = entry.get("last_error_reset_at")
             if isinstance(reset_at, (int, float)) and reset_at > time.time():
                 return False
+            if status == "exhausted":
+                if not isinstance(reset_at, (int, float)):
+                    return False
             return True
 
         for entry in entries:

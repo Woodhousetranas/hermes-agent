@@ -194,6 +194,34 @@ def test_resolve_codex_runtime_credentials_pool_fallback_skips_exhausted(tmp_pat
     assert resolved["source"] == "credential_pool"
 
 
+def test_resolve_codex_runtime_credentials_pool_fallback_skips_dead(tmp_path, monkeypatch):
+    """A dead pool entry must not make auth status/runtime look logged in."""
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    auth_store = {
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "openai-codex": [
+                {
+                    "source": "manual:device_code",
+                    "access_token": "revoked-token",
+                    "refresh_token": "revoked-refresh",
+                    "last_status": "dead",
+                    "last_error_reason": "token_revoked",
+                },
+            ],
+        },
+    }
+    (hermes_home / "auth.json").write_text(json.dumps(auth_store))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing-codex-cli"))
+
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials()
+    assert exc.value.code == "codex_auth_missing"
+
+
 def test_resolve_codex_runtime_credentials_pool_fallback_no_usable_entry(tmp_path, monkeypatch):
     """When both singleton and pool are empty/unusable, the original AuthError propagates."""
     hermes_home = tmp_path / "hermes"
@@ -209,10 +237,52 @@ def test_resolve_codex_runtime_credentials_pool_fallback_no_usable_entry(tmp_pat
     }
     (hermes_home / "auth.json").write_text(json.dumps(auth_store))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing-codex-cli"))
 
     with pytest.raises(AuthError) as exc:
         resolve_codex_runtime_credentials()
     assert exc.value.code == "codex_auth_missing"
+
+
+def test_resolve_codex_runtime_credentials_imports_cli_when_singleton_missing(tmp_path, monkeypatch):
+    """Missing Hermes singleton can self-heal from an existing Codex CLI login."""
+    hermes_home = tmp_path / "hermes"
+    codex_home = tmp_path / "codex-cli"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "openai-codex": [
+                {
+                    "id": "dead-manual",
+                    "source": "manual:device_code",
+                    "access_token": "revoked-token",
+                    "refresh_token": "revoked-refresh",
+                    "last_status": "dead",
+                    "last_error_reason": "token_revoked",
+                },
+            ],
+        },
+    }))
+    (codex_home / "auth.json").write_text(json.dumps({
+        "tokens": {"access_token": "cli-at", "refresh_token": "cli-rt"},
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    resolved = resolve_codex_runtime_credentials()
+
+    assert resolved["api_key"] == "cli-at"
+    assert resolved["source"] == "hermes-auth-store"
+    auth = json.loads((hermes_home / "auth.json").read_text())
+    pool = auth["credential_pool"]["openai-codex"]
+    seeded = next(e for e in pool if e["source"] == "device_code")
+    assert seeded["access_token"] == "cli-at"
+    assert seeded["refresh_token"] == "cli-rt"
+    dead_manual = next(e for e in pool if e["id"] == "dead-manual")
+    assert dead_manual["last_status"] == "dead"
 
 
 def test_resolve_provider_explicit_codex_does_not_fallback(monkeypatch):
@@ -232,6 +302,42 @@ def test_save_codex_tokens_roundtrip(tmp_path, monkeypatch):
 
     assert data["tokens"]["access_token"] == "at123"
     assert data["tokens"]["refresh_token"] == "rt456"
+
+
+def test_save_codex_tokens_seeds_device_code_pool_entry_when_missing(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "openai-codex": [
+                {
+                    "id": "independent",
+                    "source": "manual:device_code",
+                    "auth_type": "oauth",
+                    "access_token": "independent-at",
+                    "refresh_token": "independent-rt",
+                },
+            ],
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    _save_codex_tokens(
+        {"access_token": "new-at", "refresh_token": "new-rt"},
+        last_refresh="2026-06-15T00:00:00Z",
+    )
+
+    auth = json.loads((hermes_home / "auth.json").read_text())
+    pool = auth["credential_pool"]["openai-codex"]
+    seeded = next(e for e in pool if e["source"] == "device_code")
+    assert seeded["access_token"] == "new-at"
+    assert seeded["refresh_token"] == "new-rt"
+    assert seeded["last_refresh"] == "2026-06-15T00:00:00Z"
+    independent = next(e for e in pool if e["id"] == "independent")
+    assert independent["access_token"] == "independent-at"
+    assert independent["refresh_token"] == "independent-rt"
 
 
 def test_save_codex_tokens_syncs_credential_pool(tmp_path, monkeypatch):
