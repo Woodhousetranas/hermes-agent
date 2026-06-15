@@ -32,6 +32,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional, Sequence
@@ -380,9 +381,12 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         rotating handlers.
     """
 
+    _ROLLOVER_RETRY_SECONDS = 30.0
+
     def __init__(self, *args, **kwargs):
         from hermes_cli.config import is_managed
         self._managed = is_managed()
+        self._rollover_deferred_until = 0.0
         super().__init__(*args, **kwargs)
         # Snapshot the inode of the currently open stream so emit() can
         # detect external rotation without an extra fstat per write.
@@ -454,6 +458,20 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
             except Exception:
                 pass
 
+    def shouldRollover(self, record: logging.LogRecord) -> bool:
+        if self._rollover_deferred_until > time.monotonic():
+            return False
+        return super().shouldRollover(record)
+
+    def _defer_rollover_after_lock(self) -> None:
+        self._rollover_deferred_until = time.monotonic() + self._ROLLOVER_RETRY_SECONDS
+        if self.stream is None:
+            try:
+                self.stream = self._open()
+            except Exception:
+                pass
+        self._record_stream_stat()
+
     def emit(self, record: logging.LogRecord) -> None:
         # Cheap-ish stat-per-record check; the kernel caches inode metadata
         # so the syscall is sub-microsecond on a hot file.
@@ -467,7 +485,17 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         return stream
 
     def doRollover(self):
-        super().doRollover()
+        try:
+            super().doRollover()
+        except OSError as exc:
+            # Windows can reject the rename when another Hermes process still
+            # has the log open. Keep writing to the live file and retry later
+            # instead of surfacing a logging traceback to the operator.
+            if isinstance(exc, PermissionError) or getattr(exc, "winerror", None) == 32:
+                self._defer_rollover_after_lock()
+                return
+            raise
+        self._rollover_deferred_until = 0.0
         self._chmod_if_managed()
         # Our own rollover writes a new baseFilename; refresh the snapshot
         # so the next emit doesn't mistake it for external rotation.

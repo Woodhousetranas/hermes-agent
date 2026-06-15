@@ -33,11 +33,40 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Activate venv ───────────────────────────────────────────────────────────
+python_for_venv() {
+  local candidate="$1"
+  if [ -x "$candidate/bin/python" ]; then
+    printf "%s\n" "$candidate/bin/python"
+    return 0
+  fi
+  if [ -x "$candidate/Scripts/python.exe" ]; then
+    printf "%s\n" "$candidate/Scripts/python.exe"
+    return 0
+  fi
+  if [ -x "$candidate/Scripts/python" ]; then
+    printf "%s\n" "$candidate/Scripts/python"
+    return 0
+  fi
+  return 1
+}
+
 VENV=""
+PYTHON=""
 for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
-    VENV="$candidate"
-    break
+  if [ -f "$candidate/bin/activate" ] || [ -f "$candidate/Scripts/activate" ]; then
+    candidate_python="$(python_for_venv "$candidate" || true)"
+    if [ -z "$candidate_python" ]; then
+      continue
+    fi
+    if "$candidate_python" -c "import pytest" >/dev/null 2>&1; then
+      VENV="$candidate"
+      PYTHON="$candidate_python"
+      break
+    fi
+    if [ -z "$VENV" ]; then
+      VENV="$candidate"
+      PYTHON="$candidate_python"
+    fi
   fi
 done
 
@@ -46,7 +75,10 @@ if [ -z "$VENV" ]; then
   exit 1
 fi
 
-PYTHON="$VENV/bin/python"
+if ! "$PYTHON" -c "import pytest" >/dev/null 2>&1; then
+  echo "error: no pytest found in probed virtualenvs under $REPO_ROOT/.venv or $REPO_ROOT/venv" >&2
+  exit 1
+fi
 
 
 # ── Live-gateway plugin (computed before we drop env) ───────────────────────
@@ -66,13 +98,29 @@ echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
 
 cd "$REPO_ROOT"
 
+WINDOWS_USERPROFILE="${USERPROFILE:-}"
+if [ -z "$WINDOWS_USERPROFILE" ] && command -v cygpath >/dev/null 2>&1; then
+  WINDOWS_USERPROFILE="$(cygpath -w "$HOME" 2>/dev/null || true)"
+fi
+WINDOWS_HOMEDRIVE="${HOMEDRIVE:-}"
+WINDOWS_HOMEPATH="${HOMEPATH:-}"
+WINDOWS_TEMP="${TEMP:-${TMP:-/tmp}}"
+WINDOWS_TMP="${TMP:-$WINDOWS_TEMP}"
+
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  ${WINDOWS_USERPROFILE:+USERPROFILE="$WINDOWS_USERPROFILE"} \
+  ${WINDOWS_HOMEDRIVE:+HOMEDRIVE="$WINDOWS_HOMEDRIVE"} \
+  ${WINDOWS_HOMEPATH:+HOMEPATH="$WINDOWS_HOMEPATH"} \
+  TEMP="$WINDOWS_TEMP" \
+  TMP="$WINDOWS_TMP" \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
   PYTHONHASHSEED=0 \
+  PYTHONUTF8=1 \
+  PYTHONIOENCODING=utf-8 \
   PYTHONDONTWRITEBYTECODE=1 \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
