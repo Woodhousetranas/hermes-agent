@@ -74,6 +74,31 @@ def _patch_list_profiles(names: list[str]):
     ]
 
 
+def test_decomposer_prompt_routes_by_profile_description():
+    patches = _patch_list_profiles(["gladly-chat-worker", "gladly-risk-worker"])
+    for p in patches:
+        p.start()
+    try:
+        roster, valid_names = decomp._build_roster()
+    finally:
+        for p in patches:
+            p.stop()
+
+    formatted = decomp._format_roster(roster)
+    prompt = decomp._SYSTEM_PROMPT + "\n" + decomp._USER_TEMPLATE.format(
+        task_id="kb-1",
+        title="Investigate a chat gap and risk gate",
+        body="Split work across the right specialists.",
+        roster=formatted,
+        default_assignee="default",
+    )
+
+    assert "DESCRIPTION (not just the name)" in prompt
+    assert "gladly-chat-worker: desc for gladly-chat-worker" in prompt
+    assert "gladly-risk-worker: desc for gladly-risk-worker" in prompt
+    assert valid_names == {"gladly-chat-worker", "gladly-risk-worker"}
+
+
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="ship a feature", triage=True)

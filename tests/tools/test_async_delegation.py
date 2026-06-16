@@ -5,6 +5,7 @@ onto the shared process_registry.completion_queue, the rich re-injection block
 formatting, capacity rejection, and crash handling.
 """
 
+import json
 import queue
 import threading
 import time
@@ -13,6 +14,18 @@ import pytest
 
 from tools import async_delegation as ad
 from tools.process_registry import process_registry, format_process_notification
+
+
+def test_delegate_tool_description_documents_background_mode():
+    from tools import delegate_tool as dt
+
+    desc = dt._build_top_level_description()
+
+    assert "background=true" in desc
+    assert "returns a delegation_id immediately" in desc
+    assert "not a durable job queue" in desc
+    assert "delegate_task runs SYNCHRONOUSLY" not in desc
+    assert "Children cannot continue in the background" not in desc
 
 
 @pytest.fixture(autouse=True)
@@ -159,6 +172,67 @@ def test_dispatch_rejected_at_capacity():
     assert r3["status"] == "rejected"
     assert "capacity reached" in r3["error"]
     ev.set()
+
+
+def test_status_snapshot_tracks_activity_rejections_and_completions(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    gate = threading.Event()
+
+    def blocker():
+        gate.wait(timeout=5)
+        return {
+            "status": "completed",
+            "summary": "private child summary",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "m",
+        }
+
+    r1 = ad.dispatch_async_delegation(
+        goal="Inspect portal async status",
+        context="private context that must not be in the snapshot",
+        toolsets=["file", "session_search"],
+        role="leaf",
+        model="m",
+        session_key="session",
+        runner=blocker,
+        max_async_children=1,
+    )
+    assert r1["status"] == "dispatched"
+
+    r2 = ad.dispatch_async_delegation(
+        goal="Second task should hit capacity",
+        context=None,
+        toolsets=["file"],
+        role="leaf",
+        model="m",
+        session_key="session",
+        runner=blocker,
+        max_async_children=1,
+    )
+    assert r2["status"] == "rejected"
+
+    snapshot_path = tmp_path / "async_delegations.json"
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert snapshot["activeCount"] == 1
+    assert snapshot["maxAsyncChildren"] == 1
+    assert snapshot["rejectedAtCapacity"] == 1
+    assert snapshot["running"][0]["delegationId"] == r1["delegation_id"]
+    assert snapshot["running"][0]["toolsets"] == ["file", "session_search"]
+    assert snapshot["recentRejections"][0]["reason"] == "capacity"
+    assert snapshot["recentRejections"][0]["role"] == "leaf"
+    assert snapshot["recentRejections"][0]["toolsets"] == ["file"]
+    assert "private context" not in snapshot_path.read_text(encoding="utf-8")
+    assert "private child summary" not in snapshot_path.read_text(encoding="utf-8")
+
+    gate.set()
+    evt = _drain_one()
+    assert evt is not None
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert snapshot["activeCount"] == 0
+    assert snapshot["maxAsyncChildren"] == 1
+    assert snapshot["recentCompletions"][0]["delegationId"] == r1["delegation_id"]
+    assert snapshot["recentCompletions"][0]["status"] == "completed"
 
 
 def test_crashed_runner_produces_error_completion():

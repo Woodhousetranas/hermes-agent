@@ -36,13 +36,16 @@ logic stays in one place.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 import time
 import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures.thread import _worker
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -96,10 +99,102 @@ _records_lock = threading.Lock()
 # delegation_id -> record dict. Kept for the lifetime of the run plus a short
 # tail after completion so `list_async_delegations()` can show recent results.
 _records: Dict[str, Dict[str, Any]] = {}
+_recent_rejections: List[Dict[str, Any]] = []
+_rejected_at_capacity_count = 0
+_last_max_async_children: Optional[int] = None
 
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # How many completed records to retain for status queries before pruning.
 _MAX_RETAINED_COMPLETED = 50
+_MAX_RETAINED_REJECTIONS = 20
+_SNAPSHOT_SCHEMA_VERSION = "2026-06-16.hermes-async-delegation.v1"
+
+
+def _snapshot_path() -> Optional[Path]:
+    """Return the local status snapshot path, or None without a runtime home."""
+    home = os.environ.get("HERMES_RUNTIME_HOME") or os.environ.get("HERMES_HOME")
+    if not home:
+        return None
+    return Path(home) / "async_delegations.json"
+
+
+def _truncate(value: Any, max_length: int = 160) -> str:
+    text = str(value or "").replace("\n", " ").replace("\r", " ").strip()
+    return text[:max_length]
+
+
+def _iso(ts: Any) -> Optional[str]:
+    try:
+        value = float(ts)
+    except (TypeError, ValueError):
+        return None
+    if not value:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value))
+
+
+def _public_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitized record for operator observability.
+
+    The snapshot intentionally excludes child context and result summaries; it
+    is status telemetry, not a transcript.
+    """
+    return {
+        "delegationId": record.get("delegation_id"),
+        "status": record.get("status"),
+        "role": record.get("role"),
+        "toolsets": list(record.get("toolsets") or [])[:8],
+        "model": _truncate(record.get("model"), 80) or None,
+        "goalPreview": _truncate(record.get("goal")),
+        "dispatchedAt": _iso(record.get("dispatched_at")),
+        "completedAt": _iso(record.get("completed_at")),
+    }
+
+
+def _status_snapshot_locked(max_async_children: Optional[int] = None) -> Dict[str, Any]:
+    effective_max = max_async_children if max_async_children is not None else _last_max_async_children
+    running = [r for r in _records.values() if r.get("status") == "running"]
+    completed = [r for r in _records.values() if r.get("status") != "running"]
+    completed.sort(
+        key=lambda r: r.get("completed_at") or r.get("dispatched_at") or 0,
+        reverse=True,
+    )
+    return {
+        "schemaVersion": _SNAPSHOT_SCHEMA_VERSION,
+        "updatedAt": _iso(time.time()),
+        "activeCount": len(running),
+        "maxAsyncChildren": effective_max,
+        "running": [_public_record(r) for r in running[:10]],
+        "recentCompletions": [_public_record(r) for r in completed[:10]],
+        "rejectedAtCapacity": _rejected_at_capacity_count,
+        "recentRejections": list(_recent_rejections[-10:]),
+    }
+
+
+def _write_snapshot_locked(max_async_children: Optional[int] = None) -> None:
+    """Persist a sanitized local snapshot for runtime heartbeat/Control Room.
+
+    Caller must hold ``_records_lock``.
+    """
+    path = _snapshot_path()
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps(_status_snapshot_locked(max_async_children), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except Exception as exc:  # pragma: no cover - observability must not break work
+        logger.debug("async delegation snapshot write failed: %s", exc)
+
+
+def status_snapshot(max_async_children: Optional[int] = None) -> Dict[str, Any]:
+    """Return the sanitized async-delegation observability snapshot."""
+    with _records_lock:
+        return _status_snapshot_locked(max_async_children)
 
 
 def _get_executor(max_workers: int) -> ThreadPoolExecutor:
@@ -190,6 +285,8 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
+    global _last_max_async_children, _rejected_at_capacity_count
+    _last_max_async_children = max_async_children
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
@@ -213,6 +310,18 @@ def dispatch_async_delegation(
             1 for r in _records.values() if r.get("status") == "running"
         )
         if running >= max_async_children:
+            _rejected_at_capacity_count += 1
+            _recent_rejections.append({
+                "at": _iso(time.time()),
+                "reason": "capacity",
+                "role": role,
+                "toolsets": list(toolsets) if toolsets else None,
+                "activeCount": running,
+                "maxAsyncChildren": max_async_children,
+                "goalPreview": _truncate(goal),
+            })
+            del _recent_rejections[:-_MAX_RETAINED_REJECTIONS]
+            _write_snapshot_locked(max_async_children)
             return {
                 "status": "rejected",
                 "error": (
@@ -224,6 +333,7 @@ def dispatch_async_delegation(
                 ),
             }
         _records[delegation_id] = record
+        _write_snapshot_locked(max_async_children)
 
     executor = _get_executor(max_async_children)
 
@@ -251,6 +361,19 @@ def dispatch_async_delegation(
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
             _records.pop(delegation_id, None)
+            _recent_rejections.append({
+                "at": _iso(time.time()),
+                "reason": "schedule_failure",
+                "role": role,
+                "toolsets": list(toolsets) if toolsets else None,
+                "activeCount": sum(
+                    1 for r in _records.values() if r.get("status") == "running"
+                ),
+                "maxAsyncChildren": max_async_children,
+                "goalPreview": _truncate(goal),
+            })
+            del _recent_rejections[:-_MAX_RETAINED_REJECTIONS]
+            _write_snapshot_locked(max_async_children)
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
@@ -275,6 +398,7 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         # Snapshot fields needed for the event while holding the lock.
         event_record = dict(record)
         _prune_completed_locked()
+        _write_snapshot_locked()
 
     _push_completion_event(event_record, result, status)
 
@@ -376,7 +500,7 @@ def interrupt_all(reason: str = "shutdown") -> int:
 
 def _reset_for_tests() -> None:
     """Test-only: clear all state and tear down the executor."""
-    global _executor, _executor_max_workers
+    global _executor, _executor_max_workers, _last_max_async_children, _rejected_at_capacity_count
     with _executor_lock:
         if _executor is not None:
             _executor.shutdown(wait=False)
@@ -384,3 +508,7 @@ def _reset_for_tests() -> None:
         _executor_max_workers = 0
     with _records_lock:
         _records.clear()
+        _recent_rejections.clear()
+        _last_max_async_children = None
+        _rejected_at_capacity_count = 0
+        _write_snapshot_locked()

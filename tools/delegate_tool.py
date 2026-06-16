@@ -3,8 +3,8 @@
 Delegate Tool -- Subagent Architecture
 
 Spawns child AIAgent instances with isolated context, restricted toolsets,
-and their own terminal sessions. Supports single-task and batch (parallel)
-modes. The parent blocks until all children complete.
+and their own terminal sessions. Supports synchronous single-task, synchronous
+batch (parallel), and asynchronous single-task background dispatch.
 
 Each child gets:
   - A fresh conversation (no parent history)
@@ -13,7 +13,9 @@ Each child gets:
   - A focused system prompt built from the delegated goal + context
 
 The parent's context only sees the delegation call and the summary result,
-never the child's intermediate tool calls or reasoning.
+never the child's intermediate tool calls or reasoning. In background mode the
+call returns a handle immediately, and the summary result re-enters the
+originating conversation as a later completion message.
 """
 
 import enum
@@ -2825,7 +2827,12 @@ def _build_top_level_description() -> str:
         f"2. Batch (parallel): provide 'tasks' array with up to {max_children} "
         f"items concurrently for this user (configured via "
         f"delegation.max_concurrent_children in config.yaml). "
-        f"All run in parallel and results are returned together. {nesting_clause}\n\n"
+        f"All run in parallel and results are returned together. {nesting_clause}\n"
+        "Single-task calls may set background=true for asynchronous dispatch: "
+        "delegate_task returns a delegation_id immediately, and the result "
+        "re-enters the conversation as a later completion message. Batch "
+        "background dispatch is not supported; use one background call per "
+        "independent long-running subtask.\n\n"
         "WHEN TO USE delegate_task:\n"
         "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
         "- Tasks that would flood your context with intermediate data\n"
@@ -2834,13 +2841,15 @@ def _build_top_level_description() -> str:
         "- Mechanical multi-step work with no reasoning needed -> use execute_code\n"
         "- Single tool call -> just call the tool directly\n"
         "- Tasks needing user interaction -> subagents cannot use clarify\n"
-        "- Durable long-running work that must outlive the current turn -> "
-        "use cronjob (action='create') or terminal(background=True, "
-        "notify_on_complete=True) instead. delegate_task runs SYNCHRONOUSLY "
-        "inside the parent turn: if the parent is interrupted (user sends a "
-        "new message, /stop, /new) the child is cancelled with status="
-        "'interrupted' and its work is discarded. Children cannot continue "
-        "in the background.\n\n"
+        "- Durable scheduled/retryable work -> use cronjob (action='create') "
+        "or Portal/Work Queue contracts instead\n"
+        "- Long-running shell commands/builds/tests -> use terminal("
+        "background=True, notify_on_complete=True)\n"
+        "- background=true is only for independent single subagent tasks. "
+        "Default delegate_task calls and batch calls are synchronous inside "
+        "the parent turn. Async background subagents are best-effort detached "
+        "work: they return a handle immediately and report back through a "
+        "new completion message, but they are not a durable job queue.\n\n"
         "IMPORTANT:\n"
         "- Subagents have NO memory of your conversation. Pass all relevant "
         "info (file paths, error messages, constraints) via the 'context' field.\n"
