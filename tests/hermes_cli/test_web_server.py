@@ -1885,6 +1885,31 @@ class TestWebServerEndpoints:
         assert telegram["enabled"] is False
         assert any(field["key"] == "TELEGRAM_BOT_TOKEN" and field["required"] for field in telegram["env_vars"])
 
+    def test_get_messaging_platforms_loads_gateway_config_once(self, monkeypatch):
+        import gateway.config as gateway_config
+
+        calls = 0
+
+        class GatewayConfigSnapshot:
+            platforms = {}
+
+            def _is_platform_connected(self, platform, platform_config):
+                return False
+
+        def fake_load_gateway_config():
+            nonlocal calls
+            calls += 1
+            return GatewayConfigSnapshot()
+
+        monkeypatch.setattr(
+            gateway_config, "load_gateway_config", fake_load_gateway_config
+        )
+
+        resp = self.client.get("/api/messaging/platforms")
+
+        assert resp.status_code == 200
+        assert calls == 1
+
     def test_slack_messaging_platform_exposes_user_allowlist(self):
         resp = self.client.get("/api/messaging/platforms")
 

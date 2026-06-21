@@ -5633,10 +5633,20 @@ def _messaging_env_info(key: str) -> dict[str, Any]:
     }
 
 
-def _gateway_platform_config(platform_id: str):
+_GATEWAY_CONFIG_UNSET = object()
+
+
+def _gateway_platform_config(
+    platform_id: str, gateway_config: Any = _GATEWAY_CONFIG_UNSET
+):
     from gateway.config import Platform, load_gateway_config
 
-    config = load_gateway_config()
+    if gateway_config is _GATEWAY_CONFIG_UNSET:
+        config = load_gateway_config()
+    elif gateway_config is None:
+        raise RuntimeError("gateway config unavailable")
+    else:
+        config = gateway_config
     platform = Platform(platform_id)
     platform_config = config.platforms.get(platform)
     return config, platform, platform_config
@@ -5647,6 +5657,7 @@ def _messaging_platform_payload(
     env_on_disk: dict[str, str],
     runtime: dict | None,
     scoped: bool = False,
+    gateway_config: Any = _GATEWAY_CONFIG_UNSET,
 ) -> dict[str, Any]:
     platform_id = entry["id"]
     runtime_platforms = runtime.get("platforms") if runtime else {}
@@ -5698,7 +5709,7 @@ def _messaging_platform_payload(
     else:
         try:
             gateway_config, platform, platform_config = _gateway_platform_config(
-                platform_id
+                platform_id, gateway_config
             )
             enabled = bool(platform_config and platform_config.enabled)
             configured = bool(
@@ -6155,12 +6166,27 @@ async def get_messaging_platforms(profile: Optional[str] = None):
     with _profile_scope(profile) as scoped_dir:
         env_on_disk = load_env()
         runtime = read_runtime_status()
+        gateway_config = None
+        if scoped_dir is None:
+            try:
+                from gateway.config import load_gateway_config
+
+                gateway_config = load_gateway_config()
+            except Exception:
+                _log.debug(
+                    "could not load gateway config for messaging platform payloads",
+                    exc_info=True,
+                )
         return {
             "env_path": str(get_env_path()),
             "gateway_start_command": _gateway_display_command(profile, "start"),
             "platforms": [
                 _messaging_platform_payload(
-                    entry, env_on_disk, runtime, scoped=scoped_dir is not None
+                    entry,
+                    env_on_disk,
+                    runtime,
+                    scoped=scoped_dir is not None,
+                    gateway_config=gateway_config,
                 )
                 for entry in _messaging_platform_catalog()
             ]
