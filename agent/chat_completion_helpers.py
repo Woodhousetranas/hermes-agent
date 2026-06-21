@@ -548,6 +548,18 @@ def interruptible_api_call(agent, api_kwargs: dict):
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
         raise result["error"]
+    response_status = str(getattr(result["response"], "status", "") or "").strip().lower()
+    if (
+        agent.api_mode == "codex_responses"
+        and agent.provider == "openai-codex"
+        and response_status != "failed"
+    ):
+        try:
+            from hermes_cli.auth import clear_codex_pool_exhaustion_for_access_token
+
+            clear_codex_pool_exhaustion_for_access_token(getattr(agent, "api_key", ""))
+        except Exception:
+            logger.debug("Failed to clear stale Codex pool exhaustion after success", exc_info=True)
     return result["response"]
 
 
