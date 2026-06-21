@@ -1379,6 +1379,70 @@ def write_credential_pool(
         return _save_auth_store(auth_store)
 
 
+def _clear_codex_pool_exhaustion_in_store(
+    auth_store: Dict[str, Any],
+    access_token: str,
+) -> bool:
+    pool = auth_store.get("credential_pool")
+    if not isinstance(pool, dict):
+        return False
+    entries = pool.get("openai-codex")
+    if not isinstance(entries, list):
+        return False
+
+    changed = False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("access_token") or "").strip() != access_token:
+            continue
+        if str(entry.get("last_status") or "").strip().lower() != "exhausted":
+            continue
+        entry["last_status"] = None
+        entry["last_status_at"] = None
+        entry["last_error_code"] = None
+        entry["last_error_reason"] = None
+        entry["last_error_message"] = None
+        entry["last_error_reset_at"] = None
+        changed = True
+    return changed
+
+
+def clear_codex_pool_exhaustion_for_access_token(access_token: str) -> bool:
+    """Clear stale openai-codex pool cooldown metadata after a successful call.
+
+    The Codex Responses runtime can fall back from an exhausted pool entry to
+    the provider singleton. When that singleton succeeds, any matching pool
+    entry's 429/quota marker is stale; leaving it in place keeps status and
+    Work Queue preflight red even though the credential is usable.
+    """
+    token = str(access_token or "").strip()
+    if not token:
+        return False
+
+    changed = False
+    with _auth_store_lock():
+        auth_path = _auth_file_path()
+        auth_store = _load_auth_store(auth_path)
+        if _clear_codex_pool_exhaustion_in_store(auth_store, token):
+            _save_auth_store(auth_store, auth_path)
+            changed = True
+
+        global_path = _global_auth_file_path()
+        if global_path is not None:
+            try:
+                same_store = global_path.resolve(strict=False) == auth_path.resolve(strict=False)
+            except Exception:
+                same_store = global_path == auth_path
+            if not same_store and global_path.exists():
+                global_store = _load_auth_store(global_path)
+                if _clear_codex_pool_exhaustion_in_store(global_store, token):
+                    _save_auth_store(global_store, global_path)
+                    changed = True
+
+    return changed
+
+
 def suppress_credential_source(provider_id: str, source: str) -> None:
     """Mark a credential source as suppressed so it won't be re-seeded."""
     with _auth_store_lock():

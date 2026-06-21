@@ -17,6 +17,7 @@ from hermes_cli.auth import (
     _import_codex_cli_tokens,
     _login_openai_codex,
     refresh_codex_oauth_pure,
+    clear_codex_pool_exhaustion_for_access_token,
     resolve_codex_runtime_credentials,
     resolve_provider,
 )
@@ -405,6 +406,61 @@ def test_save_codex_tokens_syncs_credential_pool(tmp_path, monkeypatch):
 
     # Provider singleton is updated too.
     assert auth["providers"]["openai-codex"]["tokens"]["access_token"] == "new-at"
+
+
+def test_clear_codex_pool_exhaustion_for_successful_token(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "credential_pool": {
+            "openai-codex": [
+                {
+                    "id": "matching",
+                    "source": "device_code",
+                    "auth_type": "oauth",
+                    "access_token": "fresh-at",
+                    "last_status": "exhausted",
+                    "last_error_code": 429,
+                    "last_error_reason": "usage_limit_reached",
+                    "last_error_message": "usage limit reached",
+                    "last_error_reset_at": time.time() + 86400,
+                },
+                {
+                    "id": "other-account",
+                    "source": "manual:device_code",
+                    "auth_type": "oauth",
+                    "access_token": "other-at",
+                    "last_status": "exhausted",
+                    "last_error_code": 429,
+                    "last_error_reason": "usage_limit_reached",
+                },
+                {
+                    "id": "dead-match",
+                    "source": "manual:device_code",
+                    "auth_type": "oauth",
+                    "access_token": "fresh-at",
+                    "last_status": "dead",
+                    "last_error_code": 401,
+                    "last_error_reason": "token_invalidated",
+                },
+            ],
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    assert clear_codex_pool_exhaustion_for_access_token("fresh-at") is True
+
+    auth = json.loads((hermes_home / "auth.json").read_text())
+    entries = {entry["id"]: entry for entry in auth["credential_pool"]["openai-codex"]}
+    assert entries["matching"]["last_status"] is None
+    assert entries["matching"]["last_error_code"] is None
+    assert entries["matching"]["last_error_reason"] is None
+    assert entries["matching"]["last_error_reset_at"] is None
+    assert entries["other-account"]["last_status"] == "exhausted"
+    assert entries["other-account"]["last_error_reason"] == "usage_limit_reached"
+    assert entries["dead-match"]["last_status"] == "dead"
+    assert entries["dead-match"]["last_error_reason"] == "token_invalidated"
 
 
 def test_save_codex_tokens_syncs_manual_device_code_entries(tmp_path, monkeypatch):
