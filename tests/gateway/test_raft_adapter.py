@@ -1,5 +1,6 @@
 """Tests for the Raft channel adapter."""
 
+import logging
 import os
 from unittest.mock import AsyncMock, patch
 
@@ -8,6 +9,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import Platform, PlatformConfig
+import plugins.platforms.raft.adapter as raft_adapter_module
 from plugins.platforms.raft.adapter import (
     ACTIVITY_DRAIN_SCHEMA,
     ACTIVITY_EVENT_SCHEMA,
@@ -407,6 +409,36 @@ class TestRaftActivityHttp:
 
 
 class TestRaftConfig:
+    def test_check_requirements_missing_cli_is_debug_when_unconfigured(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.delenv("RAFT_PROFILE", raising=False)
+        monkeypatch.setattr(raft_adapter_module, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(raft_adapter_module.shutil, "which", lambda _: None)
+
+        with caplog.at_level(logging.DEBUG, logger=raft_adapter_module.logger.name):
+            assert check_raft_requirements() is False
+
+        assert "raft CLI not found" in caplog.text
+        assert not [
+            record
+            for record in caplog.records
+            if record.name == raft_adapter_module.logger.name
+            and record.levelno >= logging.WARNING
+        ]
+
+    def test_check_requirements_missing_cli_warns_when_configured(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("RAFT_PROFILE", "my-agent")
+        monkeypatch.setattr(raft_adapter_module, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(raft_adapter_module.shutil, "which", lambda _: None)
+
+        with caplog.at_level(logging.WARNING, logger=raft_adapter_module.logger.name):
+            assert check_raft_requirements() is False
+
+        assert "raft CLI not found" in caplog.text
+
     def test_env_enablement_auto_enables_with_raft_profile(self, monkeypatch):
         monkeypatch.setenv("RAFT_PROFILE", "my-agent")
 

@@ -99,11 +99,14 @@ _RAFT_PROMPT_TURN_IDS: set[str] = set()
 
 def check_raft_requirements() -> bool:
     """Check if Raft channel dependencies are available."""
+    requested = bool(os.getenv("RAFT_PROFILE"))
     if not AIOHTTP_AVAILABLE:
-        logger.warning("[raft] aiohttp is not installed — install with: pip install aiohttp")
+        log = logger.warning if requested else logger.debug
+        log("[raft] aiohttp is not installed - install with: pip install aiohttp")
         return False
     if not shutil.which("raft"):
-        logger.warning("[raft] raft CLI not found in PATH — install from https://raft.build")
+        log = logger.warning if requested else logger.debug
+        log("[raft] raft CLI not found in PATH - install from https://raft.build")
         return False
     return True
 
