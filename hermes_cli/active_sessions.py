@@ -93,53 +93,89 @@ class _FileLock:
     def __init__(self, path: Path):
         self.path = path
         self._fh = None
+        self._win32_mutex = None
 
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fh = open(self.path, "a+b")
         if os.name == "nt":
-            try:
-                import msvcrt
+            self._win32_mutex = self._acquire_win32_mutex()
+            return self
 
-                self._fh.seek(0)
-                msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
-            except Exception as exc:
-                self._fh.close()
-                self._fh = None
-                raise RuntimeError("active session file lock unavailable") from exc
-        else:
-            try:
-                import fcntl
+        self._fh = open(self.path, "a+b")
+        try:
+            import fcntl
 
-                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
-            except Exception as exc:
-                self._fh.close()
-                self._fh = None
-                raise RuntimeError("active session file lock unavailable") from exc
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        except Exception as exc:
+            self._fh.close()
+            self._fh = None
+            raise RuntimeError("active session file lock unavailable") from exc
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        if os.name == "nt":
+            handle = self._win32_mutex
+            self._win32_mutex = None
+            if handle is None:
+                return
+            try:
+                import ctypes
+
+                ctypes.windll.kernel32.ReleaseMutex(handle)
+            except Exception:
+                pass
+            try:
+                import ctypes
+
+                ctypes.windll.kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+            return
+
         if self._fh is None:
             return
-        if os.name == "nt":
-            try:
-                import msvcrt
+        try:
+            import fcntl
 
-                self._fh.seek(0)
-                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
-            except Exception:
-                pass
-        else:
-            try:
-                import fcntl
-
-                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
-            except Exception:
-                pass
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
         try:
             self._fh.close()
         finally:
             self._fh = None
+
+    def _acquire_win32_mutex(self):
+        try:
+            import ctypes
+            import hashlib
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+            kernel32.CreateMutexW.restype = wintypes.HANDLE
+            kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+
+            digest = hashlib.sha256(str(self.path.resolve()).lower().encode("utf-8")).hexdigest()
+            name = f"Local\\HermesActiveSessions_{digest}"
+            handle = kernel32.CreateMutexW(None, False, name)
+            if not handle:
+                raise ctypes.WinError()
+            wait_result = kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+            if wait_result not in (0x00000000, 0x00000080):  # WAIT_OBJECT_0, WAIT_ABANDONED
+                kernel32.CloseHandle(handle)
+                raise ctypes.WinError()
+            return handle
+        except Exception as exc:
+            try:
+                if "handle" in locals() and handle:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+            raise RuntimeError("active session file lock unavailable") from exc
 
 
 def _read_entries(path: Path) -> list[dict[str, Any]]:
