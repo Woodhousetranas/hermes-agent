@@ -36,7 +36,7 @@ except ImportError:
 
 import sys
 from pathlib import Path as _Path
-sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -96,20 +96,23 @@ _RAFT_SESSION_IDS: set[str] = set()
 _RAFT_TURN_IDS: set[str] = set()
 _RAFT_PROMPT_TURN_IDS: set[str] = set()
 
-
 def check_raft_requirements() -> bool:
-    """Check if Raft channel dependencies are available."""
-    requested = bool(os.getenv("RAFT_PROFILE"))
+    """Check if Raft channel dependencies are available.
+
+    Intentionally silent on failure - this is a passive probe registered as
+    the platform's ``check_fn``. It is called on every
+    ``load_gateway_config()`` (message handling, display lookups, agent
+    turns), so logging here floods the logs for every user without the
+    ``raft`` CLI installed. The caller (``gateway/platform_registry.py``
+    ``create_adapter()``) emits its own warning when requirements are not met
+    and an adapter is actually requested. This matches the convention used by
+    other platform adapters (e.g. ``teams/adapter.py``).
+    """
     if not AIOHTTP_AVAILABLE:
-        log = logger.warning if requested else logger.debug
-        log("[raft] aiohttp is not installed - install with: pip install aiohttp")
         return False
     if not shutil.which("raft"):
-        log = logger.warning if requested else logger.debug
-        log("[raft] raft CLI not found in PATH - install from https://raft.build")
         return False
     return True
-
 
 def _path_value(value: Any) -> str:
     path = str(value or DEFAULT_PATH).strip() or DEFAULT_PATH
