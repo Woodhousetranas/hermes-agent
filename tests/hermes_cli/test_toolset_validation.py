@@ -49,6 +49,11 @@ def test_mixed_valid_and_invalid_flags_only_the_invalid():
     assert "unknown toolset 'bogus'" in warnings[0]
 
 
+def test_no_mcp_sentinel_is_accepted():
+    cfg = {"telegram": ["web", "no_mcp"]}
+    assert validate_platform_toolsets(cfg, _is_valid) == []
+
+
 def test_unknown_without_valid_platform_default_omits_suggestion():
     # hermes-mystery is not a known toolset, so no "did you mean" hint.
     warnings = validate_platform_toolsets({"mystery": ["nope"]}, _is_valid)
