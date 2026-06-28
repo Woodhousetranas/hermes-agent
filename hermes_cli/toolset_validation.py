@@ -14,6 +14,8 @@ zero-tools end state) loudly turns that silent failure into an actionable one.
 
 from typing import Callable, Dict, List
 
+NO_MCP_SENTINEL = "no_mcp"
+
 
 def validate_platform_toolsets(
     platform_toolsets: object,
@@ -51,6 +53,8 @@ def validate_platform_toolsets(
         names = raw if isinstance(raw, list) else [raw]
         for name in names:
             if not isinstance(name, str) or not name:
+                continue
+            if name == NO_MCP_SENTINEL:
                 continue
             if is_valid_toolset(name):
                 valid_count += 1
