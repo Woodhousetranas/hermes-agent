@@ -1065,22 +1065,25 @@ class TestExternalRotationRecovery:
         )
         handler.setLevel(logging.INFO)
         handler.setFormatter(logging.Formatter("%(message)s"))
-        rotate_calls = 0
+        rollover_attempts = 0
 
-        def locked_rotate(_source, _dest):
-            nonlocal rotate_calls
-            rotate_calls += 1
+        def locked_rollover(*_args):
+            nonlocal rollover_attempts
+            rollover_attempts += 1
             raise PermissionError(13, "file is locked by another process")
 
-        handler.rotate = locked_rotate
+        if sys.platform == "win32":
+            rollover_patch = patch("concurrent_log_handler.os.rename", side_effect=locked_rollover)
+        else:
+            rollover_patch = patch.object(handler, "rotate", side_effect=locked_rollover)
         try:
-            with patch.object(handler, "handleError") as handle_error:
+            with rollover_patch, patch.object(handler, "handleError") as handle_error:
                 self._emit(handler, "first record")
                 self._emit(handler, "second record")
                 self._emit(handler, "third record")
 
             handle_error.assert_not_called()
-            assert rotate_calls == 1
+            assert rollover_attempts == 1
             content = log_path.read_text()
             assert "first record" in content
             assert "second record" in content

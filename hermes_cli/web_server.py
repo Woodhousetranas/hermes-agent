@@ -5479,6 +5479,17 @@ def _messaging_platform_catalog() -> tuple[dict[str, Any], ...]:
 
     seen: set[str] = set()
     entries: list[dict[str, Any]] = []
+    plugin_entries: dict[str, Any] = {}
+
+    try:
+        from gateway.platform_registry import platform_registry
+
+        plugin_entries = {
+            plugin_entry.name: plugin_entry
+            for plugin_entry in platform_registry.plugin_entries()
+        }
+    except Exception:
+        _log.debug("plugin platform registry unavailable", exc_info=True)
 
     for member in Platform.__members__.values():
         if member.value == "local":
@@ -5486,18 +5497,13 @@ def _messaging_platform_catalog() -> tuple[dict[str, Any], ...]:
         if member.value in seen:
             continue
         seen.add(member.value)
-        entries.append(_build_catalog_entry(member.value))
+        entries.append(_build_catalog_entry(member.value, plugin_entries.get(member.value)))
 
-    try:
-        from gateway.platform_registry import platform_registry
-
-        for plugin_entry in platform_registry.plugin_entries():
-            if plugin_entry.name in seen:
-                continue
-            seen.add(plugin_entry.name)
-            entries.append(_build_catalog_entry(plugin_entry.name, plugin_entry))
-    except Exception:
-        _log.debug("plugin platform registry unavailable", exc_info=True)
+    for plugin_entry in plugin_entries.values():
+        if plugin_entry.name in seen:
+            continue
+        seen.add(plugin_entry.name)
+        entries.append(_build_catalog_entry(plugin_entry.name, plugin_entry))
 
     order = {pid: idx for idx, pid in enumerate(_PLATFORM_ORDER)}
     entries.sort(

@@ -555,6 +555,7 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         return stream
 
     def doRollover(self):
+        before_rollovers = getattr(self, "num_rollovers", None)
         try:
             super().doRollover()
         except OSError as exc:
@@ -565,6 +566,18 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
                 self._defer_rollover_after_lock()
                 return
             raise
+        # concurrent-log-handler catches Windows rename failures internally and
+        # returns with the stream closed and rollover count unchanged. Treat
+        # that as the same transient lock case so later log writes continue.
+        after_rollovers = getattr(self, "num_rollovers", None)
+        if (
+            sys.platform == "win32"
+            and before_rollovers is not None
+            and after_rollovers == before_rollovers
+            and self.stream is None
+        ):
+            self._defer_rollover_after_lock()
+            return
         self._rollover_deferred_until = 0.0
         self._chmod_if_managed()
         # Our own rollover writes a new baseFilename; refresh the snapshot
