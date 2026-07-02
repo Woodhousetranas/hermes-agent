@@ -23,6 +23,7 @@ from cron.jobs import (
     update_job,
     pause_job,
     resume_job,
+    mark_job_skip,
     trigger_job,
     JOBS_FILE,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "update_job",
     "pause_job",
     "resume_job",
+    "mark_job_skip",
     "trigger_job",
     "tick",
     "JOBS_FILE",

@@ -18,6 +18,7 @@ from cron.jobs import (
     resume_job,
     remove_job,
     mark_job_run,
+    mark_job_skip,
     advance_next_run,
     claim_dispatch,
     get_due_jobs,
@@ -488,10 +489,32 @@ class TestResolveJobRef:
 class TestMarkJobRun:
     def test_increments_completed(self, tmp_cron_dir):
         job = create_job(prompt="Test", schedule="every 1h")
+        update_job(job["id"], {
+            "last_skip_at": "2026-07-01T10:00:00+00:00",
+            "last_skip_reason": "already_running",
+            "consecutive_skips": 3,
+        })
         mark_job_run(job["id"], success=True)
         updated = get_job(job["id"])
         assert updated["repeat"]["completed"] == 1
         assert updated["last_status"] == "ok"
+        assert updated["last_skip_at"] is None
+        assert updated["last_skip_reason"] is None
+        assert updated["consecutive_skips"] == 0
+
+    def test_mark_job_skip_records_guard_without_status_change(self, tmp_cron_dir):
+        job = create_job(prompt="Test prompt", schedule="every 1h")
+        mark_job_run(job["id"], success=True)
+
+        mark_job_skip(job["id"], "already_running")
+        mark_job_skip(job["id"], "already_running")
+
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "ok"
+        assert updated["last_error"] is None
+        assert updated["last_skip_reason"] == "already_running"
+        assert updated["last_skip_at"] is not None
+        assert updated["consecutive_skips"] == 2
 
     def test_repeat_limit_removes_job(self, tmp_cron_dir):
         job = create_job(prompt="Once", schedule="30m", repeat=1)

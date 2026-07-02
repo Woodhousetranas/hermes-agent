@@ -1280,6 +1280,9 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
                 job["last_error"] = error if not success else None
+                job["last_skip_at"] = None
+                job["last_skip_reason"] = None
+                job["consecutive_skips"] = 0
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
                 # Clear any external-fire claim so a re-armed recurring job can
@@ -1349,6 +1352,24 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 return
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+
+
+def mark_job_skip(job_id: str, reason: str):
+    """Record a scheduler skip without changing the job's success/error status."""
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] == job_id:
+                job["last_skip_at"] = _hermes_now().isoformat()
+                job["last_skip_reason"] = reason
+                try:
+                    job["consecutive_skips"] = int(job.get("consecutive_skips") or 0) + 1
+                except Exception:
+                    job["consecutive_skips"] = 1
+                save_jobs(jobs)
+                return
+
+        logger.warning("mark_job_skip: job_id %s not found, skipping save", job_id)
 
 
 def claim_dispatch(job_id: str) -> bool:

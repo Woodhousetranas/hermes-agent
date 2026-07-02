@@ -82,16 +82,19 @@ class TestRunningJobGuard:
         sched._running_job_ids.add("guard-job")
 
         dispatched = []
+        skipped = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "run_job", lambda j: dispatched.append(j["id"]) or (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "mark_job_skip", lambda job_id, reason: skipped.append((job_id, reason)))
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
 
         n = sched.tick(verbose=False)
         assert n == 0  # skipped, not dispatched
         assert dispatched == []
+        assert skipped == [("guard-job", "already_running")]
 
         sched._running_job_ids.discard("guard-job")
         sched._shutdown_parallel_pool()
@@ -247,16 +250,19 @@ class TestSequentialPool:
         sched._running_job_ids.add("guard-seq")
 
         dispatched = []
+        skipped = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "run_job", lambda j: dispatched.append(j["id"]) or (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "mark_job_skip", lambda job_id, reason: skipped.append((job_id, reason)))
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
 
         n = sched.tick(verbose=False)
         assert n == 0  # skipped, not dispatched
         assert dispatched == []
+        assert skipped == [("guard-seq", "already_running")]
 
         sched._running_job_ids.discard("guard-seq")
         sched._shutdown_parallel_pool()

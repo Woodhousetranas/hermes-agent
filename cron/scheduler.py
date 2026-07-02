@@ -237,7 +237,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch
+from cron.jobs import get_due_jobs, mark_job_run, mark_job_skip, save_job_output, advance_next_run, claim_dispatch
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -3336,6 +3336,7 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             job_id = job["id"]
             with _running_lock:
                 if job_id in _running_job_ids:
+                    mark_job_skip(job_id, "already_running")
                     logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                     return None
                 _running_job_ids.add(job_id)
