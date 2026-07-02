@@ -744,6 +744,23 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     return str(resolved)
 
 
+def _normalize_script_timeout_seconds(value: Any) -> Optional[int]:
+    """Normalize an optional per-job script timeout in seconds."""
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    if isinstance(value, bool):
+        raise ValueError("Cron script_timeout_seconds must be a positive number")
+    try:
+        timeout = int(float(value))
+    except Exception as exc:
+        raise ValueError("Cron script_timeout_seconds must be a positive number") from exc
+    if timeout <= 0:
+        raise ValueError("Cron script_timeout_seconds must be a positive number")
+    return timeout
+
+
 def _resolve_default_model_snapshot() -> Optional[str]:
     """Resolve the global default model the same way the cron ticker does.
 
@@ -865,6 +882,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    script_timeout_seconds: Optional[Union[int, float, str]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -941,6 +959,7 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_script_timeout = _normalize_script_timeout_seconds(script_timeout_seconds)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1017,6 +1036,8 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    if normalized_script_timeout is not None:
+        job["script_timeout_seconds"] = normalized_script_timeout
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -1111,6 +1132,13 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            if "script_timeout_seconds" in updates:
+                _timeout = updates["script_timeout_seconds"]
+                if _timeout is None or _timeout == "" or _timeout is False:
+                    updates["script_timeout_seconds"] = None
+                else:
+                    updates["script_timeout_seconds"] = _normalize_script_timeout_seconds(_timeout)
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})

@@ -85,6 +85,25 @@ class TestJobScriptField:
         updated = update_job(job["id"], {"script": None})
         assert updated.get("script") is None
 
+    def test_create_update_and_clear_script_timeout(self, cron_env):
+        from cron.jobs import create_job, update_job
+
+        job = create_job(
+            prompt=None,
+            schedule="every 5m",
+            script="watchdog.py",
+            no_agent=True,
+            deliver="local",
+            script_timeout_seconds="240",
+        )
+        assert job["script_timeout_seconds"] == 240
+
+        updated = update_job(job["id"], {"script_timeout_seconds": "120"})
+        assert updated["script_timeout_seconds"] == 120
+
+        cleared = update_job(job["id"], {"script_timeout_seconds": None})
+        assert cleared.get("script_timeout_seconds") is None
+
 
 class TestRunJobScript:
     """Test the _run_job_script() function."""
@@ -180,6 +199,16 @@ class TestRunJobScript:
         success, output = _run_job_script(str(script))
         assert success is False
         assert "timed out" in output.lower()
+
+    def test_script_uses_job_specific_timeout(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "slow_job.py"
+        script.write_text("import time; time.sleep(30)\n")
+
+        success, output = _run_job_script(str(script), script_timeout_seconds=1)
+        assert success is False
+        assert "timed out after 1s" in output
 
     def test_script_json_output(self, cron_env):
         """Scripts can output structured JSON for the LLM to parse."""

@@ -592,6 +592,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     }
     if job.get("script"):
         result["script"] = job["script"]
+    if job.get("script_timeout_seconds"):
+        result["script_timeout_seconds"] = job["script_timeout_seconds"]
     if job.get("no_agent"):
         result["no_agent"] = True
     if job.get("enabled_toolsets"):
@@ -667,6 +669,7 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    script_timeout_seconds: Optional[Union[int, float, str]] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -740,6 +743,7 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
+                script_timeout_seconds=script_timeout_seconds,
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -917,6 +921,8 @@ def cronjob(
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
                 updates["workdir"] = _normalize_optional_job_value(workdir) or None
+            if script_timeout_seconds is not None:
+                updates["script_timeout_seconds"] = script_timeout_seconds
             if no_agent is not None:
                 # Toggling no_agent on/off at update time. If flipping to True,
                 # we need a script to already exist on the job (or be part of
@@ -1049,6 +1055,10 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                     "WHEN TO USE False (default): anything that needs reasoning — summarize a feed, draft a daily briefing, pick interesting items, rephrase data for a human, follow conditional logic based on content."
                 ),
             },
+            "script_timeout_seconds": {
+                "type": "number",
+                "description": "Optional positive timeout for the script phase. Use for script-only watchdogs where a hung run must not block the next scheduled fire."
+            },
             "context_from": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1130,6 +1140,7 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        script_timeout_seconds=args.get("script_timeout_seconds"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

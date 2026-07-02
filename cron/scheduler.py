@@ -1748,23 +1748,51 @@ _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _get_script_timeout() -> int:
-    """Resolve cron pre-run script timeout from module/env/config with a safe default."""
+def _coerce_positive_timeout(value, *, source: str, strict: bool = False) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    if isinstance(value, bool):
+        if strict:
+            raise ValueError(f"{source} must be a positive number of seconds")
+        return None
+    try:
+        timeout = int(float(value))
+    except Exception:
+        if strict:
+            raise ValueError(f"{source} must be a positive number of seconds")
+        return None
+    if timeout > 0:
+        return timeout
+    if strict:
+        raise ValueError(f"{source} must be a positive number of seconds")
+    return None
+
+
+def _get_script_timeout(script_timeout_seconds=None) -> int:
+    """Resolve cron script timeout from job/env/config with a safe default."""
+    job_timeout = _coerce_positive_timeout(
+        script_timeout_seconds,
+        source="script_timeout_seconds",
+        strict=script_timeout_seconds is not None,
+    )
+    if job_timeout is not None:
+        return job_timeout
+
     if _SCRIPT_TIMEOUT != _DEFAULT_SCRIPT_TIMEOUT:
-        try:
-            timeout = int(float(_SCRIPT_TIMEOUT))
-            if timeout > 0:
-                return timeout
-        except Exception:
+        timeout = _coerce_positive_timeout(_SCRIPT_TIMEOUT, source="_SCRIPT_TIMEOUT")
+        if timeout is not None:
+            return timeout
+        else:
             logger.warning("Invalid patched _SCRIPT_TIMEOUT=%r; using env/config/default", _SCRIPT_TIMEOUT)
 
     env_value = os.getenv("HERMES_CRON_SCRIPT_TIMEOUT", "").strip()
     if env_value:
-        try:
-            timeout = int(float(env_value))
-            if timeout > 0:
-                return timeout
-        except Exception:
+        timeout = _coerce_positive_timeout(env_value, source="HERMES_CRON_SCRIPT_TIMEOUT")
+        if timeout is not None:
+            return timeout
+        else:
             logger.warning("Invalid HERMES_CRON_SCRIPT_TIMEOUT=%r; using config/default", env_value)
 
     try:
@@ -1772,8 +1800,8 @@ def _get_script_timeout() -> int:
         cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
         configured = cron_cfg.get("script_timeout_seconds")
         if configured is not None:
-            timeout = int(float(configured))
-            if timeout > 0:
+            timeout = _coerce_positive_timeout(configured, source="cron.script_timeout_seconds")
+            if timeout is not None:
                 return timeout
     except Exception as exc:
         logger.debug("Failed to load cron script timeout from config: %s", exc)
@@ -1781,7 +1809,7 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(script_path: str, *, script_timeout_seconds=None) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -1837,7 +1865,10 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
-    script_timeout = _get_script_timeout()
+    try:
+        script_timeout = _get_script_timeout(script_timeout_seconds)
+    except ValueError as exc:
+        return False, str(exc)
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
@@ -1960,7 +1991,10 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(
+                script_path,
+                script_timeout_seconds=job.get("script_timeout_seconds"),
+            )
         if success:
             if script_output:
                 prompt = (
@@ -2300,7 +2334,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 _prior_cwd = None
 
         try:
-            ok, output = _run_job_script(script_path)
+            ok, output = _run_job_script(
+                script_path,
+                script_timeout_seconds=job.get("script_timeout_seconds"),
+            )
         finally:
             if _prior_cwd is not None:
                 try:
@@ -2389,7 +2426,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script(script_path)
+        prerun_script = _run_job_script(
+            script_path,
+            script_timeout_seconds=job.get("script_timeout_seconds"),
+        )
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
@@ -3148,7 +3188,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
         confirm_script = str(job.get("delivery_confirm_script") or "").strip()
         if should_deliver and delivery_error is None and confirm_script:
-            confirm_ok, confirm_output = _run_job_script(confirm_script)
+            confirm_ok, confirm_output = _run_job_script(
+                confirm_script,
+                script_timeout_seconds=job.get("script_timeout_seconds"),
+            )
             if not confirm_ok:
                 delivery_error = f"delivery confirm script failed: {confirm_output}"
                 logger.error("Delivery confirm failed for job %s: %s", job["id"], confirm_output)
