@@ -3884,7 +3884,7 @@ async function waitForHermes(baseUrl, token) {
 
   while (Date.now() < deadline) {
     try {
-      await fetchJson(`${baseUrl}/api/status`, token)
+      await fetchPublicJson(`${baseUrl}/api/ready`, { timeoutMs: 2_500 })
       return
     } catch (error) {
       lastError = error
@@ -6087,7 +6087,7 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
 
   const base = conn.baseUrl.replace(/\/+$/, '')
   try {
-    await fetchPublicJson(`${base}/api/status`, { timeoutMs: 2_500 })
+    await fetchPublicJson(`${base}/api/ready`, { timeoutMs: 2_500 })
     return { ok: true, rebuilt: false }
   } catch {
     // Unreachable remote: drop the stale cache so the renderer's next reconnect

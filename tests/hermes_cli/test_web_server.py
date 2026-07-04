@@ -267,6 +267,16 @@ class TestWebServerEndpoints:
         assert "active_sessions" in data
         assert data["can_update_hermes"] is True
 
+    def test_get_ready_is_minimal_liveness_probe(self):
+        resp = self.client.get("/api/ready")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert "version" in data
+        assert "auth_required" in data
+        assert "active_sessions" not in data
+        assert "hermes_home" not in data
+
     def test_gateway_drain_begin_writes_marker(self):
         from gateway import drain_control
 

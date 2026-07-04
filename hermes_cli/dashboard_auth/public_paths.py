@@ -31,6 +31,10 @@ the SPA should bootstrap it after login instead.
 from __future__ import annotations
 
 PUBLIC_API_PATHS: frozenset[str] = frozenset({
+    # Minimal process liveness probe. Unlike /api/status, this endpoint must
+    # stay free of database/config/plugin reads so desktop boot and reconnects
+    # can distinguish "uvicorn is accepting requests" from richer status work.
+    "/api/ready",
     # Liveness probe target. Returns version, gateway state, active
     # session count, and the dashboard auth-gate shape. No bodies, no
     # session content, no secrets. Documented as the portal's wildcard

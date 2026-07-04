@@ -2239,8 +2239,7 @@ async def git_branch_switch_route(body: GitBranchSwitchBody):
     return await _git_op(_web_git.branch_switch, _git_path(body.path), body.branch)
 
 
-@app.get("/api/status")
-async def get_status(profile: Optional[str] = None):
+def _get_status_payload(profile: Optional[str] = None):
     status_scope = None
     requested_profile = (profile or "").strip()
     # Plain /api/status stays the machine-level public liveness probe. The
@@ -2267,10 +2266,7 @@ async def get_status(profile: Optional[str] = None):
         remote_health_body: dict | None = None
 
         if not gateway_running and _GATEWAY_HEALTH_URL:
-            loop = asyncio.get_running_loop()
-            alive, remote_health_body = await loop.run_in_executor(
-                None, _probe_gateway_health
-            )
+            alive, remote_health_body = _probe_gateway_health()
             if alive:
                 gateway_running = True
                 # PID from the remote container (display only — not locally valid)
@@ -2375,9 +2371,7 @@ async def get_status(profile: Optional[str] = None):
         # exceeding the desktop handshake's 15s socket timeout.  After the
         # first call the module is in sys.modules and run_in_executor returns
         # in microseconds.
-        restart_drain_timeout = await asyncio.get_running_loop().run_in_executor(
-            None, _resolve_restart_drain_timeout
-        )
+        restart_drain_timeout = _resolve_restart_drain_timeout()
 
         # Dashboard auth gate (Phase 7): surface whether the gate is engaged
         # and which providers are registered so ``hermes status`` and the
@@ -2439,6 +2433,27 @@ async def get_status(profile: Optional[str] = None):
     finally:
         if status_scope is not None:
             status_scope.__exit__(*sys.exc_info())
+
+
+@app.get("/api/ready")
+async def get_ready():
+    """Cheap dashboard process liveness probe.
+
+    Keep this endpoint free of filesystem, database, plugin, and gateway-state
+    reads. Desktop uses it to decide whether a backend is accepting requests;
+    the richer `/api/status` payload is intentionally built on a worker thread.
+    """
+    return {
+        "ok": True,
+        "version": __version__,
+        "auth_required": bool(getattr(app.state, "auth_required", False)),
+    }
+
+
+@app.get("/api/status")
+async def get_status(profile: Optional[str] = None):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _get_status_payload, profile)
 
 
 _WINDOWS_11_MIN_BUILD = 22000
