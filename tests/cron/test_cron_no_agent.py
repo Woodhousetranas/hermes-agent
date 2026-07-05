@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -307,6 +308,23 @@ def test_run_job_script_bash_extension_also_runs_via_bash(hermes_env):
     ok, output = _run_job_script("thing.bash")
     assert ok is True
     assert output == "via bash"
+
+
+def test_run_job_shell_script_allows_msys_path_conversion_on_windows(hermes_env, monkeypatch):
+    if sys.platform != "win32":
+        pytest.skip("MSYS path conversion is a Windows/Git Bash concern")
+
+    from cron.scheduler import _run_job_script
+
+    monkeypatch.setenv("MSYS_NO_PATHCONV", "1")
+    monkeypatch.setenv("MSYS2_ARG_CONV_EXCL", "*")
+
+    script_path = hermes_env / "scripts" / "msys-env.sh"
+    script_path.write_text('printf "pathconv:%s:%s\\n" "${MSYS_NO_PATHCONV:-}" "${MSYS2_ARG_CONV_EXCL:-}"\n')
+
+    ok, output = _run_job_script("msys-env.sh")
+    assert ok is True
+    assert output == "pathconv::"
 
 
 def test_run_job_script_python_still_runs_via_python(hermes_env):

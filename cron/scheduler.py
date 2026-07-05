@@ -1969,6 +1969,15 @@ def _run_job_script(script_path: str, *, script_timeout_seconds=None) -> tuple[b
     try:
         from tools.environments.local import _sanitize_subprocess_env
 
+        script_env = _sanitize_subprocess_env(os.environ.copy())
+        if suffix in {".sh", ".bash"} and sys.platform == "win32":
+            # Cron shell scripts pass Git-Bash /c/... paths to native Windows
+            # tools such as Bun. The generic terminal env disables MSYS path
+            # conversion to protect Windows CLI flags; for trusted scripts that
+            # breaks real file paths before the tool sees them.
+            script_env.pop("MSYS_NO_PATHCONV", None)
+            script_env.pop("MSYS2_ARG_CONV_EXCL", None)
+
         popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
         result = subprocess.run(
             argv,
@@ -1978,7 +1987,7 @@ def _run_job_script(script_path: str, *, script_timeout_seconds=None) -> tuple[b
             errors="replace",
             timeout=script_timeout,
             cwd=str(path.parent),
-            env=_sanitize_subprocess_env(os.environ.copy()),
+            env=script_env,
             **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
