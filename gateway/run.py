@@ -67,6 +67,7 @@ _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+_GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
@@ -1260,7 +1261,7 @@ _ensure_ssl_certs()
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_hermes_home_override
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
 _hermes_home = get_hermes_home()
 
@@ -1562,6 +1563,16 @@ if _config_path.exists():
                 os.environ["HERMES_GATEWAY_BUSY_TEXT_MODE"] = str(_display_cfg["busy_text_mode"])
             if "busy_ack_enabled" in _display_cfg:
                 os.environ["HERMES_GATEWAY_BUSY_ACK_ENABLED"] = str(_display_cfg["busy_ack_enabled"])
+            # This process-level env var is documented as an override for
+            # service managers, so preserve it when already set. Other display
+            # bridges stay config-authoritative for backwards compatibility.
+            if (
+                "busy_steer_ack_enabled" in _display_cfg
+                and "HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED" not in os.environ
+            ):
+                os.environ["HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED"] = str(
+                    _display_cfg["busy_steer_ack_enabled"]
+                )
         # Timezone: bridge config.yaml → HERMES_TIMEZONE env var.
         _tz_cfg = _cfg.get("timezone", "")
         if _tz_cfg and isinstance(_tz_cfg, str):
@@ -1868,6 +1879,23 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
     }
+
+
+def _credential_pool_for_provider(provider: Optional[str]):
+    """Return the live credential pool for a provider id (e.g. ``custom:hyper``)."""
+    if not provider or not str(provider).strip():
+        return None
+    try:
+        return _resolve_runtime_agent_kwargs_for_provider(str(provider).strip()).get(
+            "credential_pool"
+        )
+    except Exception:
+        logger.debug(
+            "Failed to resolve credential pool for provider=%s",
+            provider,
+            exc_info=True,
+        )
+        return None
 
 
 def _try_resolve_fallback_provider() -> dict | None:
@@ -2232,6 +2260,14 @@ def _teams_pipeline_plugin_enabled() -> bool:
     return "teams_pipeline" in enabled or "teams-pipeline" in enabled
 
 
+def _gateway_config_home() -> Path:
+    """Return the Hermes home that gateway config reads should use."""
+    override = get_hermes_home_override()
+    if override:
+        return Path(override)
+    return _hermes_home
+
+
 def _load_gateway_config() -> dict:
     """Load and parse ~/.hermes/config.yaml, returning {} on any error.
 
@@ -2243,7 +2279,8 @@ def _load_gateway_config() -> dict:
     gateway honors administrator-pinned values — neither read_raw_config nor a
     direct yaml.safe_load carries the managed merge on its own. Fail-open.
     """
-    config_path = _hermes_home / 'config.yaml'
+    config_home = _gateway_config_home()
+    config_path = config_home / 'config.yaml'
     raw: dict = {}
     used_canonical = False
     try:
@@ -3666,8 +3703,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
                 "max_tokens": override.get("max_tokens"),
+                "credential_pool": override.get("credential_pool"),
             }
             if override_runtime.get("api_key"):
+                if override_runtime.get("credential_pool") is None:
+                    override_runtime["credential_pool"] = _credential_pool_for_provider(
+                        override.get("provider")
+                    )
                 logger.debug(
                     "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
                     resolved_session_key or "", model, override_model,
@@ -5298,20 +5340,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
 
-        # Debounce: only send an acknowledgment once every 30 seconds per session
-        # to avoid spamming the user when they send multiple messages quickly
+        # Debounce before consulting config-heavy display settings. Rapid
+        # follow-ups should be processed but should not trigger another config
+        # read just to discover that no ack will be sent.
         _BUSY_ACK_COOLDOWN = 30
         now = time.time()
         last_ack = self._busy_ack_ts.get(session_key, 0)
         if now - last_ack < _BUSY_ACK_COOLDOWN:
             return True  # interrupt sent (if not queue), ack already delivered recently
 
+        from gateway.display_config import resolve_display_setting
+        platform_key = _platform_config_key(event.source.platform)
+
+        # In steer mode the user's text has already been injected into the
+        # active run. Some mobile chat setups want that steering to be silent,
+        # like STT transcript echo suppression: keep the behavior, drop only
+        # the confirmation bubble.
+        if is_steer_mode:
+            steer_ack_env = os.environ.get("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED")
+            if steer_ack_env is not None:
+                steer_ack_enabled = steer_ack_env.strip().lower() in {"1", "true", "yes", "on"}
+            else:
+                steer_ack_enabled = bool(
+                    resolve_display_setting(
+                        _load_gateway_config(),
+                        platform_key,
+                        "busy_steer_ack_enabled",
+                        True,
+                    )
+                )
+            if not steer_ack_enabled:
+                logger.debug("Busy steer ack suppressed for session %s", session_key)
+                return True
+
         self._busy_ack_ts[session_key] = now
 
         # Build a status-rich acknowledgment. Mobile chat defaults keep this
         # terse; detailed iteration/tool state is still available in logs and
         # can be opted in per platform via display.platforms.<platform>.busy_ack_detail.
-        from gateway.display_config import resolve_display_setting
         status_parts = []
         busy_ack_detail_enabled = bool(
             resolve_display_setting(
@@ -9825,12 +9891,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 f"Enable it with: `hermes skills config`"
                             )
                     user_instruction = event.get_command_args().strip()
-                    msg = build_skill_invocation_message(
-                        cmd_key, user_instruction, task_id=_quick_key
-                    )
-                    if msg:
-                        event.text = msg
-                        # Fall through to normal message processing with skill content
+                    # Stacked slash-skill invocations: `/skill-a /skill-b do
+                    # XYZ` loads every leading skill (up to 5), not just the
+                    # first. Inspired by Claude Code v2.1.199. Mirrors CLI.
+                    try:
+                        from agent.skill_commands import (
+                            build_stacked_skill_invocation_message as _build_stacked,
+                            split_stacked_skill_commands,
+                        )
+                        extra_keys, stacked_instruction = (
+                            split_stacked_skill_commands(user_instruction)
+                        )
+                    except Exception:
+                        _build_stacked = None
+                        extra_keys, stacked_instruction = [], user_instruction
+                    if extra_keys and _build_stacked is not None:
+                        stacked_result = _build_stacked(
+                            [cmd_key, *extra_keys],
+                            stacked_instruction,
+                            task_id=_quick_key,
+                        )
+                        if stacked_result:
+                            msg, _loaded, _missing = stacked_result
+                            event.text = msg
+                            # Fall through to normal message processing
+                        else:
+                            return f"Failed to load stacked skills for /{command}."
+                    else:
+                        msg = build_skill_invocation_message(
+                            cmd_key, user_instruction, task_id=_quick_key
+                        )
+                        if msg:
+                            event.text = msg
+                            # Fall through to normal message processing with skill content
                 else:
                     # Not an active skill — check if it's a known-but-disabled or
                     # uninstalled skill and give actionable guidance.
@@ -10099,10 +10192,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text,
                     audio_paths,
                 )
-                # Echo each successful transcript back to the user immediately,
-                # before the agent loop runs. Lets the user verify STT quality
-                # in real-time and see the raw whisper output verbatim.
-                if _successful_transcripts:
+                # Echo each successful transcript back to the user immediately
+                # when configured. Lets users verify STT quality in real-time,
+                # while allowing quiet STT for users who only want the agent to
+                # receive the transcription.
+                if _successful_transcripts and self._should_echo_stt_transcripts():
                     _echo_adapter = self.adapters.get(source.platform)
                     _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     if _echo_adapter:
@@ -10773,11 +10867,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
                         )
                         if _hyg_runtime.get("api_key"):
+                            # Pass the FULL transcript (tool results included).
+                            # Filtering to user/assistant-only starved the
+                            # compressor: tool results are usually the bulk of
+                            # the context, _prune_old_tool_results never saw
+                            # them, and short filtered histories tripped the
+                            # protect-first/last early-return so nothing was
+                            # compressed at all (#3854). The agent loop passes
+                            # its full message list to _compress_context — the
+                            # gateway now matches.
                             _hyg_msgs = [
-                                {"role": m.get("role"), "content": m.get("content")}
-                                for m in history
-                                if m.get("role") in {"user", "assistant"}
-                                and m.get("content")
+                                m for m in history
+                                if m.get("role") in {"user", "assistant", "tool"}
                             ]
 
                             if len(_hyg_msgs) >= 4:
@@ -11417,6 +11518,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._set_session_reasoning_override(session_key, None)
                 if hasattr(self, "_pending_model_notes"):
                     self._pending_model_notes.pop(session_key, None)
+                # Clear per-session model cache so the post-reset turn
+                # resolves from current config, not a stale fallback.
+                _lrm = getattr(self, "_last_resolved_model", None)
+                if _lrm is not None:
+                    _lrm.pop(session_key, None)
                 if new_entry is not None:
                     # Drop the stale reference to the bloated compressed child and
                     # re-point the Telegram topic binding at the fresh session.
@@ -12577,6 +12683,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
         return True
+
+    def _should_echo_stt_transcripts(self) -> bool:
+        """Return whether inbound voice/STT transcripts should be echoed to chat."""
+        return bool(getattr(self.config, "stt_echo_transcripts", True))
 
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
@@ -14678,9 +14788,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
                 text, audio_paths,
             )
-            # Echo raw transcripts back to the user so voice interrupts
-            # feel identical to fresh voice messages.
-            if successful_transcripts:
+            # Echo raw transcripts back to the user when configured so voice
+            # interrupts feel identical to fresh voice messages.
+            if successful_transcripts and self._should_echo_stt_transcripts():
                 echo_adapter = self.adapters.get(source.platform)
                 echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
                 if echo_adapter:
@@ -15286,6 +15396,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
                 override["api_key"] = runtime.get("api_key")
                 override["api_mode"] = runtime.get("api_mode")
+                override["credential_pool"] = runtime.get("credential_pool")
                 if not override.get("base_url"):
                     override["base_url"] = runtime.get("base_url")
             except Exception:
@@ -15315,10 +15426,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
-        for key in ("provider", "api_key", "base_url", "api_mode"):
+        for key in ("provider", "api_key", "base_url", "api_mode", "credential_pool"):
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val
+        if (
+            runtime_kwargs.get("api_key")
+            and runtime_kwargs.get("credential_pool") is None
+            and override.get("provider")
+        ):
+            runtime_kwargs["credential_pool"] = _credential_pool_for_provider(
+                override.get("provider")
+            )
         return model, runtime_kwargs
 
     def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:
@@ -16185,6 +16304,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 _stream_consumer.on_delta(content)
                                 except json.JSONDecodeError:
                                     pass
+                        if len(buffer) > _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS:
+                            raise ValueError(
+                                "Proxy SSE stream exceeded max buffer size without a line boundary"
+                            )
 
         except asyncio.CancelledError:
             raise
@@ -16412,6 +16535,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
+        from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
+        _generic_status_recent: List[str] = []
+        _generic_status_catalog = resolve_status_phrase_catalog(user_config, platform_key)
+
+        def _display_surface_mode(
+            setting: str,
+            *,
+            default: bool = False,
+            require_platform_override_for: set[Any] | None = None,
+            allow_generic: bool = False,
+        ) -> str:
+            """Return off|raw|generic for a gateway visibility surface."""
+            if require_platform_override_for:
+                current_platform = _gateway_platform_value(source.platform)
+                platform_only = {
+                    _gateway_platform_value(item)
+                    for item in require_platform_override_for
+                }
+                if (
+                    current_platform in platform_only
+                    and not _has_platform_display_override(user_config, platform_key, setting)
+                ):
+                    return "off"
+            value = resolve_display_setting(user_config, platform_key, setting, default)
+            if isinstance(value, str) and value.strip().lower() == "generic":
+                return "generic" if allow_generic else "off"
+            return "raw" if bool(value) else "off"
+
+        def _generic_status_phrase(kind: str, *, tool_name: str | None = None, preview: str | None = None, args: Any = None) -> str:
+            try:
+                return choose_status_phrase(
+                    kind,
+                    tool_name=tool_name,
+                    preview=preview,
+                    args=args,
+                    recent=_generic_status_recent,
+                    catalog=_generic_status_catalog,
+                )
+            except Exception as _phrase_err:
+                logger.debug("generic status phrase selection failed: %s", _phrase_err)
+                return "still on it" if kind in {"heartbeat", "waiting", "long_running", "status"} else "one sec"
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
@@ -16423,29 +16587,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
+        interim_assistant_messages_mode = _display_surface_mode(
+            "interim_assistant_messages",
+            default=True,
+            require_platform_override_for={Platform.MATTERMOST},
+        )
         interim_assistant_messages_enabled = (
             source.platform != Platform.WEBHOOK
-            and _resolve_gateway_display_bool(
-                user_config,
-                platform_key,
-                "interim_assistant_messages",
-                default=True,
-                platform=source.platform,
-                require_platform_override_for={Platform.MATTERMOST},
-            )
+            and interim_assistant_messages_mode != "off"
         )
         # thinking_progress is independent — if enabled, we need the progress
         # queue even when tool_progress is off (thinking relay uses same infra).
         # Mattermost requires a per-platform opt-in: global scratch-text display
         # is too easy to leak into busy public threads.
-        _thinking_enabled = _resolve_gateway_display_bool(
-            user_config,
-            platform_key,
+        _thinking_mode = _display_surface_mode(
             "thinking_progress",
             default=False,
-            platform=source.platform,
             require_platform_override_for={Platform.MATTERMOST},
         )
+        _thinking_enabled = _thinking_mode != "off"
         needs_progress_queue = tool_progress_enabled or _thinking_enabled
 
 
@@ -16609,7 +16769,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return
             last_tool[0] = tool_name
-            
+
             # Build progress message with primary argument preview
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
@@ -17409,18 +17569,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
                     return
+                display_text = text
                 if _stream_consumer is not None:
                     if already_streamed:
                         _stream_consumer.on_segment_break()
                     else:
-                        _stream_consumer.on_commentary(text)
+                        _stream_consumer.on_commentary(display_text)
                     return
-                if already_streamed or not _status_adapter or not str(text or "").strip():
+                if already_streamed or not _status_adapter or not str(display_text or "").strip():
                     return
                 safe_schedule_threadsafe(
                     _status_adapter.send(
                         _status_chat_id,
-                        text,
+                        display_text,
                         metadata=_status_thread_metadata,
                     ),
                     _loop_for_step,
@@ -18535,7 +18696,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 # real transcript instead of an empty string
                                 # (or file-path placeholder). Matches the UX
                                 # of fresh voice messages including the
-                                # 🎙️ echo back to the user.
+                                # optional 🎙️ echo back to the user.
                                 _media_urls = getattr(_peek_event, "media_urls", None) or []
                                 _media_types = getattr(_peek_event, "media_types", None) or []
                                 _audio_paths = []
@@ -18553,7 +18714,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             pending_text, _audio_paths,
                                         )
                                         pending_text = _enriched
-                                        if _transcripts:
+                                        if _transcripts and self._should_echo_stt_transcripts():
                                             _echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
                                             for _tx in _transcripts:
                                                 try:
@@ -18591,14 +18752,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # 0 = disable notifications.
         _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
-        if not bool(
-            resolve_display_setting(
-                user_config,
-                platform_key,
-                "long_running_notifications",
-                True,
-            )
-        ):
+        _long_running_mode = _display_surface_mode(
+            "long_running_notifications",
+            default=True,
+            allow_generic=True,
+        )
+        if _long_running_mode == "off":
             _NOTIFY_INTERVAL = None
         _notify_start = time.time()
 
@@ -18660,7 +18819,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _status_detail = " — " + ", ".join(_parts)
                     except Exception:
                         pass
-                _heartbeat_text = f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                _heartbeat_text = (
+                    _generic_status_phrase("status")
+                    if _long_running_mode == "generic"
+                    else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                )
                 try:
                     _notify_res = None
                     if _heartbeat_msg_id:
@@ -18952,9 +19115,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Transcribe audio media on the dequeued event BEFORE it is
                     # handed back as the next user turn, so queued/interrupting
                     # voice messages drain with the real transcript instead of
-                    # a file-path placeholder. Echo each transcript back to the
-                    # user (same 🎙️ format as fresh voice messages) so voice
-                    # interrupts feel identical to text interrupts.
+                    # a file-path placeholder. When configured, echo each
+                    # transcript back to the user in the same 🎙️ format as
+                    # fresh voice messages.
                     _pending_text = pending_event.text or ""
                     _media_urls = getattr(pending_event, "media_urls", None) or []
                     _media_types = getattr(pending_event, "media_types", None) or []
@@ -18973,7 +19136,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _pending_text, _audio_paths,
                             )
                             pending = _enriched or None
-                            if _transcripts:
+                            if _transcripts and self._should_echo_stt_transcripts():
                                 _echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
                                 for _tx in _transcripts:
                                     try:
@@ -20205,22 +20368,39 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
     released — so this is a no-op on the normal shutdown path and the actual
     cleanup on the early-exit paths.
 
-    Logging is not flushed here: the gateway's handlers are synchronous
-    ``RotatingFileHandler``s that write each record immediately (no
-    ``MemoryHandler``/``QueueHandler`` buffering), so there is nothing pending.
-    Only stdio is buffered, so only stdio is flushed.
+    Logging IS drained here: the rotating file handlers are driven by an
+    async ``QueueListener`` on a dedicated thread (see
+    ``hermes_logging._register_queued_handler``), so records emitted right
+    before shutdown may still be sitting in the in-memory queue. ``os._exit``
+    below bypasses ``atexit``, so the ``atexit``-registered listener drain
+    never runs on this path — we drain explicitly (bounded, via
+    ``drain_log_queue``) or lose the last log lines (including the shutdown
+    reason on the early-exit paths). Stdio is flushed too.
     """
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.flush()
         except Exception:
             pass
-    # Guaranteed cleanup chokepoint: os._exit skips atexit, and the early
-    # SystemExit exit paths never run _stop_impl, so release here (idempotent).
+    # Release PID + runtime lock BEFORE the log drain: the drain is bounded but
+    # could still take up to its timeout on a wedged disk, and these locks must
+    # never be stranded. os._exit skips atexit, and the early SystemExit exit
+    # paths never run _stop_impl, so release here (idempotent).
     try:
         from gateway.status import remove_pid_file, release_gateway_runtime_lock
         remove_pid_file()
         release_gateway_runtime_lock()
+    except Exception:
+        pass
+    # Drain the async log queue: os._exit bypasses atexit, so the listener's
+    # atexit drain won't fire. Use drain_log_queue() (bounded, no restart), NOT
+    # flush_log_queue(): if the listener is wedged on the rotation lock — the
+    # exact failure this async-logging change survives — an unbounded stop()
+    # join would re-freeze the shutdown. drain_log_queue() no-ops when logging
+    # never initialized a queue (very early aborts), so this is always safe.
+    try:
+        from hermes_logging import drain_log_queue
+        drain_log_queue(timeout=1.0)
     except Exception:
         pass
     os._exit(exit_code)
