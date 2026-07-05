@@ -128,6 +128,9 @@ const {
   resolveTimeoutMs
 } = require('./hardening.cjs')
 
+const REMOTE_BACKEND_STALL_TIMEOUT_MS = 120_000
+const REMOTE_REVALIDATE_TIMEOUT_MS = 15_000
+
 let nodePty = null
 let nodePtyDir = null
 
@@ -5008,8 +5011,17 @@ async function fetchJsonForProfile(profile, path) {
 async function requestJsonForProfile(profile, path, method, body) {
   const conn = await ensureBackend(profile)
   const url = `${conn.baseUrl}${path}`
-  const opts = { method, body, timeoutMs: DEFAULT_FETCH_TIMEOUT_MS }
+  const opts = {
+    method,
+    body,
+    timeoutMs: conn.mode === 'remote' ? REMOTE_BACKEND_STALL_TIMEOUT_MS : DEFAULT_FETCH_TIMEOUT_MS
+  }
   return conn.authMode === 'oauth' ? fetchJsonViaOauthSession(url, opts) : fetchJson(url, conn.token, opts)
+}
+
+function isHardRemoteLivenessFailure(error) {
+  const message = error instanceof Error ? error.message : String(error || '')
+  return /\b(ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|socket hang up)\b/i.test(message)
 }
 
 async function probeRemoteAuthMode(rawUrl) {
@@ -6087,13 +6099,25 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
 
   const base = conn.baseUrl.replace(/\/+$/, '')
   try {
-    await fetchPublicJson(`${base}/api/ready`, { timeoutMs: 2_500 })
+    await fetchPublicJson(`${base}/api/ready`, { timeoutMs: REMOTE_REVALIDATE_TIMEOUT_MS })
     return { ok: true, rebuilt: false }
-  } catch {
+  } catch (error) {
+    if (!isHardRemoteLivenessFailure(error)) {
+      rememberLog(
+        `Cached remote Hermes backend liveness probe timed out or stalled; keeping existing connection. ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+      return { ok: false, rebuilt: false, transient: true }
+    }
     // Unreachable remote: drop the stale cache so the renderer's next reconnect
     // tick rebuilds a fresh, reachable descriptor. resetHermesConnection only
     // nulls connectionPromise for a remote (no child to SIGTERM).
-    rememberLog('Cached remote Hermes backend failed liveness probe; dropping stale connection.')
+    rememberLog(
+      `Cached remote Hermes backend failed hard liveness probe; dropping stale connection. ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    )
     resetHermesConnection()
     return { ok: true, rebuilt: true }
   }
@@ -6518,7 +6542,8 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   // defeating the deletion and leaving a zombie process.
   const routeProfile = tornDownProfile ? null : profile
   const connection = await ensureBackend(routeProfile)
-  const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+  const defaultTimeoutMs = connection.mode === 'remote' ? REMOTE_BACKEND_STALL_TIMEOUT_MS : DEFAULT_FETCH_TIMEOUT_MS
+  const timeoutMs = resolveTimeoutMs(request?.timeoutMs, defaultTimeoutMs)
   const requestPath = pathWithGlobalRemoteProfile(request.path, profile, {
     globalRemote: globalRemoteActive(),
     profileRemoteOverride: profileHasRemoteOverride(profile)
