@@ -2649,7 +2649,11 @@ def _get_status_payload(profile: Optional[str] = None):
         if gateway_running and gateway_state is None and remote_health_body is not None:
             gateway_state = "running"
 
-        active_sessions = await _status_active_sessions()
+        try:
+            active_sessions = _count_status_active_sessions()
+        except Exception as exc:
+            logging.warning("/api/status active session count failed: %s", exc)
+            active_sessions = 0
 
         # Busy/drainable readout (NAS lifecycle-safety gate).  active_agents is
         # the in-flight gateway-turn count the gateway now persists at every
