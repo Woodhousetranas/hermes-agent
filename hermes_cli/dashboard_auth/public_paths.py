@@ -31,9 +31,13 @@ the SPA should bootstrap it after login instead.
 from __future__ import annotations
 
 PUBLIC_API_PATHS: frozenset[str] = frozenset({
-    # Minimal process liveness probe. Unlike /api/status, this endpoint must
-    # stay free of database/config/plugin reads so desktop boot and reconnects
-    # can distinguish "uvicorn is accepting requests" from richer status work.
+    # Minimal process liveness probe for desktop/backend boot handshakes. It
+    # intentionally avoids gateway config, platform discovery, MCP setup, and
+    # host-local detail so readiness checks cannot spend their budget inside
+    # cold plugin imports.
+    "/api/health",
+    # Compatibility alias kept for Gladly Desktop/scripts that still probe
+    # the pre-/api/health readiness path.
     "/api/ready",
     # Liveness probe target. Returns version, gateway state, active
     # session count, and the dashboard auth-gate shape. No bodies, no
