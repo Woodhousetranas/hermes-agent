@@ -306,6 +306,7 @@ from plugins.platforms.telegram.telegram_network import (
     parse_fallback_ip_env,
 )
 from utils import atomic_replace, env_float, env_int
+from plugins.platforms.telegram.gladly_approvals import GladlyTelegramApprovalsMixin
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
@@ -614,7 +615,7 @@ class _PollingLifecycleAbort(RuntimeError):
     """Internal control flow for polling startup fenced by teardown."""
 
 
-class TelegramAdapter(BasePlatformAdapter):
+class TelegramAdapter(GladlyTelegramApprovalsMixin, BasePlatformAdapter):
     """
     Telegram bot adapter.
 
@@ -733,6 +734,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # long model call. Back off per chat so a short Telegram-side outage
         # does not spam the API/logs or burn the keep-typing budget.
         self._telegram_typing_cooldown_until: Dict[str, float] = {}
+        self._gladly_approval_buttons: Dict[str, Dict[str, Any]] = {}
         self._telegram_typing_cooldown_seconds: float = self._coerce_float_extra(
             "typing_cooldown_seconds",
             30.0,
@@ -4432,12 +4434,24 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         
         try:
+            gladly_reply_markup = None
+            try:
+                content, gladly_reply_markup = self._extract_gladly_approval_buttons(content)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Failed to prepare Gladly approval buttons; sending text fallback: %s",
+                    self.name,
+                    exc,
+                    exc_info=True,
+                )
+
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(content, metadata=metadata):
+            # Skip rich path when Gladly approval buttons must attach.
+            if gladly_reply_markup is None and self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
@@ -4537,12 +4551,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 for _send_attempt in range(3):
                     try:
                         # Try Markdown first, fall back to plain text if it fails
+                        reply_markup = gladly_reply_markup if i == 0 else None
                         try:
                             msg = await self._bot.send_message(
                                 chat_id=normalize_telegram_chat_id(chat_id),
                                 text=chunk,
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
+                                reply_markup=reply_markup,
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
@@ -4557,6 +4573,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     text=plain_chunk,
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
+                                    reply_markup=reply_markup,
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
@@ -6304,6 +6321,28 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Gladly Portal approval callbacks (ga:short_id / gw:short_id:preset) ---
+        if data.startswith("ga:"):
+            await self._handle_gladly_approval_callback(
+                query,
+                data,
+                chat_id=query_chat_id,
+                chat_type=query_chat_type,
+                thread_id=query_thread_id,
+                user_name=query_user_name,
+            )
+            return
+        if data.startswith("gw:"):
+            await self._handle_gladly_approval_wait_callback(
+                query,
+                data,
+                chat_id=query_chat_id,
+                chat_type=query_chat_type,
+                thread_id=query_thread_id,
+                user_name=query_user_name,
+            )
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
@@ -8784,6 +8823,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "chat", None), "id", None),
             )
             return
+        if await self._handle_gladly_approval_comment_message(msg):
+            return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
@@ -8800,6 +8841,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming command messages."""
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
+            return
+        if await self._handle_gladly_approval_comment_message(msg):
             return
         if not self._should_process_message(msg, is_command=True):
             return
