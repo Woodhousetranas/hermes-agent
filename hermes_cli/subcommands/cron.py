@@ -110,6 +110,19 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').",
     )
+    cron_create.add_argument(
+        "--continuity",
+        dest="continuity",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Each run wakes up with the job's own previous output injected "
+            "into its prompt, so it can dedupe against what was already "
+            "reported and continue where the last run left off (scouts, "
+            "monitors, incremental digests). First run is unchanged."
+        ),
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -174,6 +187,27 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--script-timeout-seconds",
         type=int,
         help="Optional positive timeout for the script phase, in seconds.",
+    )
+    cron_edit.add_argument(
+        "--continuity",
+        dest="continuity",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Turn on run-to-run continuity: each run sees the job's own "
+            "previous output (dedupe, continue where it left off)."
+        ),
+    )
+    cron_edit.add_argument(
+        "--no-continuity",
+        dest="continuity",
+        action="store_const",
+        const=False,
+        help=(
+            "Turn off run-to-run continuity (other context_from job refs "
+            "are preserved)."
+        ),
     )
     cron_edit.add_argument(
         "--monitor-script",

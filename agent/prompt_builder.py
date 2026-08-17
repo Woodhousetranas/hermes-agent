@@ -642,8 +642,9 @@ def computer_use_guidance(platform_name: Optional[str] = None) -> str:
         "`computer_use.grant_existing_profile: true` (if unset, report the "
         "refusal and name that key — you can never grant it yourself); "
         "bounded mode authorizes via the user's reviewed capability manifest; "
-        "explicit Hermes YOLO uses a private unrestricted daemon after the "
-        "user's launch/session risk acceptance.\n\n"
+        "explicit Hermes YOLO uses an unrestricted runtime after the user's "
+        "launch/session risk acceptance. Permission mode and grants are fixed "
+        "when Hermes launches that runtime.\n\n"
         "## Background mode rules\n"
         "- Do NOT use `raise_window=true` on `focus_app` unless the user "
         "explicitly asked you to bring a window to front. Input routing to "
@@ -653,9 +654,11 @@ def computer_use_guidance(platform_name: Optional[str] = None) -> str:
         "won't leak other windows the user has open.\n"
         + offscreen_line +
         "## The agent cursor you'll see on screen\n"
-        "Each computer-use run declares a session with cua-driver; that "
-        "session owns a tinted overlay cursor that glides to where you "
-        "act. It's a visual cue for the user — the REAL OS cursor never "
+        "Each computer-use run gives cua-driver a public session name. The "
+        "name labels its tinted overlay cursor and related state, while the "
+        "MCP transport owns a private lifecycle session inside the runtime. "
+        "The cursor glides "
+        "to where you act. It's a visual cue for the user; the REAL OS cursor never "
         "moves. Don't try to read it or click on it; it's UI feedback, "
         "not input.\n\n"
         "## Safety\n"
@@ -1780,8 +1783,14 @@ def build_skills_system_prompt(
         _home_token = None
     try:
         external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+        # Trusted project-local dirs (./.hermes/skills, ./.agents/skills at
+        # the git root) — highest-precedence tier, scanned before local.
+        # Resolved once here; cwd and trust are stable for the session, so
+        # the index (and the system prompt) stays byte-stable.
+        from agent.skill_utils import get_project_skills_dirs
+        project_dirs = get_project_skills_dirs()
 
-        if not skills_dir.exists() and not external_dirs:
+        if not skills_dir.exists() and not external_dirs and not project_dirs:
             return ""
 
         return _build_skills_system_prompt_inner(
@@ -1790,6 +1799,7 @@ def build_skills_system_prompt(
             available_tools,
             available_toolsets,
             compact_categories,
+            project_dirs=project_dirs,
         )
     finally:
         if _home_token is not None:
@@ -1802,14 +1812,17 @@ def _build_skills_system_prompt_inner(
     available_tools: "set[str] | None",
     available_toolsets: "set[str] | None",
     compact_categories: "frozenset[str] | None",
+    project_dirs: "list[Path] | None" = None,
 ) -> str:
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
+    project_dirs = project_dirs or []
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
+        tuple(str(d) for d in project_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
@@ -1873,6 +1886,50 @@ def _build_skills_system_prompt_inner(
             ):
                 continue
             visible_entries.append(entry)
+
+    # ── Project-local skills (highest precedence) ──────────────────────
+    # Scanned before the local/org pass; names claimed here shadow same-named
+    # profile-local skills below (that's the feature — vendored repo skills
+    # win inside their repo). Each entry is tagged so the model and the user
+    # can see where it came from.
+    project_names: set[str] = set()
+    for proj_dir in project_dirs:
+        if not proj_dir.exists():
+            continue
+        for skill_file in iter_skill_index_files(proj_dir, "SKILL.md"):
+            try:
+                is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
+                if not is_compatible:
+                    continue
+                entry = _build_snapshot_entry(skill_file, proj_dir, frontmatter, desc)
+                fm_name = entry["frontmatter_name"]
+                if fm_name in project_names:
+                    continue
+                if fm_name in disabled or entry["skill_name"] in disabled:
+                    continue
+                if not _skill_should_show(
+                    extract_skill_conditions(frontmatter),
+                    available_tools,
+                    available_toolsets,
+                ):
+                    continue
+                project_names.add(fm_name)
+                skills_by_category.setdefault(entry["category"], []).append(
+                    (fm_name, f"[project] {entry['description']}".strip())
+                )
+            except Exception as e:
+                logger.debug("Error reading project skill %s: %s", skill_file, e)
+
+    if project_names:
+        # Drop profile-local entries shadowed by a project skill BEFORE the
+        # org-labeling pass so collision flags don't fire on intentional
+        # project-over-local overrides.
+        visible_entries = [
+            e
+            for e in visible_entries
+            if (e.get("frontmatter_name") or e.get("skill_name") or "")
+            not in project_names
+        ]
 
     # ── M2 org labeling + FAIL-LOUD collisions ─────────────────────────
     # An org skill lists with an explicit provenance tag. When a personal and
@@ -2271,18 +2328,21 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     """AGENTS.md — merged directory chain from git root down to cwd.
 
     Each directory on the chain (see ``_agents_md_directory_chain``)
-    contributes its ``AGENTS.md`` / ``agents.md`` (first name wins per
-    directory) as its own provenance-labelled section.  Identical content
-    encountered again further down the chain (copied or symlinked files) is
-    deduplicated.  With a single match — the common case, and always the
-    case outside a git repo — output is identical to the historical
-    single-file behavior.
+    contributes its ``AGENTS.override.md`` / ``AGENTS.md`` / ``agents.md``
+    (first name wins per directory) as its own provenance-labelled section.
+    ``AGENTS.override.md`` wins over ``AGENTS.md`` so a developer can keep a
+    personal, typically-gitignored override next to the committed project
+    instructions without editing the tracked file (same convention as
+    earendil-works/pi#7681).  Identical content encountered again further
+    down the chain (copied or symlinked files) is deduplicated.  With a
+    single match — the common case, and always the case outside a git repo —
+    output is identical to the historical single-file behavior.
     """
     cwd_resolved = cwd_path.resolve()
     sections: List[str] = []
     seen_content: set = set()
     for directory in _agents_md_directory_chain(cwd_resolved):
-        for name in ["AGENTS.md", "agents.md"]:
+        for name in ["AGENTS.override.md", "AGENTS.md", "agents.md"]:
             candidate = directory / name
             if not candidate.exists():
                 continue
