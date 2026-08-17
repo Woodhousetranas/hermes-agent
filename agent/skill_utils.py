@@ -5,6 +5,7 @@ heavy dependency chain.  It is safe to import at module level without triggering
 tool registration or provider resolution.
 """
 
+import ast
 import logging
 import os
 import re
@@ -289,10 +290,12 @@ _ENV_DETECT_CACHE: Dict[str, bool] = {}
 def _detect_environment(env: str) -> bool:
     """Return True when the named runtime environment is currently active.
 
-    Cached per process. Unknown env names return True (fail-open: never hide a
-    skill because of a tag we don't understand).
+    Cached per process, EXCEPT ``kanban``: that verdict is context-dependent
+    (a delegate_task child or an in-process cron job sees the worker's
+    HERMES_KANBAN_* vars without owning them), so caching it process-wide would
+    freeze whichever context asked first and leak it to the others.
     """
-    if env in _ENV_DETECT_CACHE:
+    if env != "kanban" and env in _ENV_DETECT_CACHE:
         return _ENV_DETECT_CACHE[env]
 
     result = True
@@ -304,6 +307,20 @@ def _detect_environment(env: str) -> bool:
         # gate on (``tools/kanban_tools.py``) so the offer filter agrees with
         # tool availability.
         if os.getenv("HERMES_KANBAN_TASK") or os.getenv("HERMES_KANBAN_BOARD"):
+            # ...but only when this execution actually owns the dispatcher's
+            # task. A delegate_task child or a cron job fired in-process from a
+            # worker sees the worker's vars without being that worker.
+            try:
+                from agent.delegation_context import (
+                    is_dispatcher_owned_worker_context,
+                )
+
+                _owns_dispatcher_task = is_dispatcher_owned_worker_context()
+            except Exception:
+                _owns_dispatcher_task = True
+        else:
+            _owns_dispatcher_task = False
+        if _owns_dispatcher_task:
             result = True
         else:
             try:
@@ -455,12 +472,34 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     return global_disabled
 
 
+def parse_config_string_list(value) -> List[str]:
+    """Normalize a config value that may hold a JSON-array string into a list.
+
+    ``hermes config set`` and JSON-mode editor saves store lists as quoted
+    JSON strings (``'["a","b"]'`` or the Python-literal ``"['a']"``). Treating
+    such a string as a single name makes a curated disabled list silently
+    filter nothing (#86661); parsing it restores the intended list. A scalar
+    string still means one name (#13026).
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("["):
+            try:
+                parsed = ast.literal_eval(stripped)
+            except (ValueError, SyntaxError):
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed]
+        return [value]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [str(item) for item in value]
+    return []
+
+
 def _normalize_string_set(values) -> Set[str]:
-    if values is None:
-        return set()
-    if isinstance(values, str):
-        values = [values]
-    return {str(v).strip() for v in values if str(v).strip()}
+    return {name.strip() for name in parse_config_string_list(values) if name.strip()}
 
 
 # ── External skills directories ──────────────────────────────────────────
