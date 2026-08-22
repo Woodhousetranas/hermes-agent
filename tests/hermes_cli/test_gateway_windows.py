@@ -18,6 +18,24 @@ import hermes_cli.setup as setup
 _BREAKAWAY_MARKER = "_HERMES_GATEWAY_BREAKAWAY"
 
 
+def _managed_launch_values(runtime_path: str) -> dict[str, str]:
+    return {
+        "HERMES_GATEWAY_RUNTIME_PATH": runtime_path,
+        "PATH": runtime_path,
+        "HERMES_GATEWAY_START_VALIDATOR": str(Path(sys.executable).resolve()),
+        "HERMES_GATEWAY_START_VALIDATOR_ARGS": (
+            env_loader._encode_gateway_start_validator_args(["validate-start"])
+        ),
+    }
+
+
+def _set_managed_launch_env(monkeypatch, runtime_path: str) -> dict[str, str]:
+    values = _managed_launch_values(runtime_path)
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    return values
+
+
 
 
 def test_schtasks_encoding_falls_back_to_utf8(monkeypatch):
@@ -77,6 +95,9 @@ def test_build_gateway_argv_keeps_venv_console_python_for_uv_venv(monkeypatch, t
     monkeypatch.setenv(
         "HERMES_GATEWAY_WORKING_DIR", str(tmp_path / "stale-working-copy")
     )
+    reviewed_runtime_path = r"C:\Reviewed\bin;C:\Windows\System32"
+    monkeypatch.setenv("PATH", r"C:\poison")
+    managed_values = _set_managed_launch_env(monkeypatch, reviewed_runtime_path)
 
     argv, cwd, env_overlay = gateway_windows._build_gateway_argv()
 
@@ -94,12 +115,19 @@ def test_build_gateway_argv_keeps_venv_console_python_for_uv_venv(monkeypatch, t
     assert str(tmp_path / "stale-user-checkout") not in env_overlay["PYTHONPATH"]
     assert env_overlay["HERMES_RUNTIME_HOME"] == str(hermes_home.resolve())
     assert env_overlay["GLADLY_HERMES_CODE_ROOT"] == str(project.resolve())
+    assert env_overlay["PATH"] == reviewed_runtime_path
+    assert env_overlay["HERMES_GATEWAY_RUNTIME_PATH"] == reviewed_runtime_path
     lock_values, lock_cwd = env_loader._decode_gateway_launch_env_lock(
         env_overlay[env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR]
     )
     assert lock_values == {
-        key: env_overlay[key] for key in env_loader._GATEWAY_LAUNCH_ENV_KEYS
+        key: env_overlay[key]
+        for key in (
+            *env_loader._GATEWAY_LAUNCH_ENV_KEYS,
+            *env_loader._GATEWAY_MANAGED_LAUNCH_ENV_KEYS,
+        )
     }
+    assert {key: env_overlay[key] for key in managed_values} == managed_values
     assert lock_cwd == cwd
 
 
@@ -175,6 +203,61 @@ def test_spawn_detached_marks_primary_breakaway_success(monkeypatch, tmp_path, c
     assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["stdout"] is kwargs["stderr"]
     assert not caplog.records
+
+
+@pytest.mark.windows_only
+def test_managed_direct_spawn_passes_only_allowlisted_environment(
+    monkeypatch,
+    tmp_path,
+):
+    windows_dir = gateway_windows._windows_directory()
+    runtime_path = f"{Path(sys.executable).parent};{windows_dir / 'System32'}"
+    managed = _managed_launch_values(runtime_path)
+    reviewed = tmp_path / "reviewed"
+    home = tmp_path / "home"
+    reviewed.mkdir()
+    home.mkdir()
+    overlay = {
+        "HERMES_HOME": str(home),
+        "HERMES_RUNTIME_HOME": str(home),
+        "GLADLY_HERMES_CODE_ROOT": str(reviewed),
+        "PYTHONPATH": str(reviewed),
+        "VIRTUAL_ENV": str(tmp_path / "venv"),
+        "HERMES_GATEWAY_DETACHED": "1",
+        **managed,
+    }
+    overlay[env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR] = (
+        env_loader._encode_gateway_launch_env_lock(overlay, reviewed)
+    )
+    monkeypatch.setenv("NODE_OPTIONS", "--require=poison.js")
+    monkeypatch.setenv("BASH_ENV", "poison.sh")
+    calls = []
+    monkeypatch.setattr(
+        gateway_windows,
+        "_build_gateway_argv",
+        lambda: (
+            [sys.executable, "-m", "hermes_cli.main", "gateway", "run"],
+            str(reviewed),
+            dict(overlay),
+        ),
+    )
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: home)
+    monkeypatch.setattr(
+        gateway_windows.subprocess,
+        "Popen",
+        lambda argv, **kwargs: calls.append((argv, kwargs))
+        or SimpleNamespace(pid=54321),
+    )
+
+    assert gateway_windows._spawn_detached() == 54321
+    child_env = calls[0][1]["env"]
+    assert child_env["PATH"] == runtime_path
+    assert child_env["HERMES_GATEWAY_START_VALIDATOR"] == managed[
+        "HERMES_GATEWAY_START_VALIDATOR"
+    ]
+    assert child_env[_BREAKAWAY_MARKER] == "1"
+    assert "NODE_OPTIONS" not in child_env
+    assert "BASH_ENV" not in child_env
 
 
 @pytest.mark.windows_only
@@ -317,6 +400,147 @@ def test_gateway_cmd_script_pins_runtime_and_forces_utf8_environment(monkeypatch
     assert "%PYTHONPATH%" not in content
     assert "stale-user-checkout" not in content
     assert env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR in content
+
+
+@pytest.mark.windows_only
+def test_gateway_launchers_bake_exact_opt_in_runtime_path_and_lock_it(monkeypatch):
+    reviewed_path = (
+        r"C:\Reviewed\venv\Scripts;C:\Program Files\Git\usr\bin;"
+        r"C:\Windows\System32"
+    )
+    monkeypatch.setenv("PATH", r"C:\poison")
+    monkeypatch.setenv("NODE_OPTIONS", "--require=C:\\poison.js")
+    monkeypatch.setenv("PYTHONSTARTUP", r"C:\poison.py")
+    monkeypatch.setenv("BASH_ENV", r"C:\poison.sh")
+    managed_values = _set_managed_launch_env(monkeypatch, reviewed_path)
+
+    cmd = gateway_windows._build_gateway_cmd_script(
+        r"C:\Reviewed\venv\Scripts\python.exe",
+        r"C:\Reviewed",
+        r"C:\Runtime\home",
+        "",
+        code_root=r"C:\Reviewed",
+    )
+    vbs = gateway_windows._build_gateway_vbs_script(
+        r"C:\Reviewed\venv\Scripts\python.exe",
+        r"C:\Reviewed",
+        r"C:\Runtime\home",
+        "",
+        code_root=r"C:\Reviewed",
+    )
+
+    assert "wscript.exe" in cmd.casefold()
+    assert '"%~dpn0.vbs"' in cmd
+    assert r"C:\poison" not in cmd
+    assert "--require=C:\\poison.js" not in vbs
+    assert r"C:\poison.py" not in vbs
+    assert r"C:\poison.sh" not in vbs
+    assert "env.Remove inheritedKeys(keyIndex)" in vbs
+    assert (
+        'env.Item("HERMES_GATEWAY_RUNTIME_PATH") = '
+        + gateway_windows._quote_vbs_string(reviewed_path)
+    ) in vbs
+    assert (
+        'env.Item("PATH") = ' + gateway_windows._quote_vbs_string(reviewed_path)
+    ) in vbs
+    lock_line = next(
+        line
+        for line in vbs.splitlines()
+        if line.startswith(
+            f'env.Item("{env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR}") = '
+        )
+    )
+    encoded = lock_line.split(" = ", 1)[1].strip('"')
+    values, cwd = env_loader._decode_gateway_launch_env_lock(encoded)
+    assert cwd == r"C:\Reviewed"
+    assert values["PATH"] == reviewed_path
+    assert values["HERMES_GATEWAY_RUNTIME_PATH"] == reviewed_path
+    assert {key: values[key] for key in managed_values} == managed_values
+
+
+@pytest.mark.windows_only
+def test_managed_child_environment_is_from_empty_allowlist(monkeypatch, tmp_path):
+    windows_dir = gateway_windows._windows_directory()
+    runtime_path = f"{Path(sys.executable).parent};{windows_dir / 'System32'}"
+    managed = _managed_launch_values(runtime_path)
+    base = {
+        "HERMES_HOME": str(tmp_path / "home"),
+        "HERMES_RUNTIME_HOME": str(tmp_path / "home"),
+        "GLADLY_HERMES_CODE_ROOT": str(tmp_path / "code"),
+        "PYTHONPATH": str(tmp_path / "code"),
+        "VIRTUAL_ENV": str(tmp_path / "venv"),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "HERMES_GATEWAY_DETACHED": "1",
+        **managed,
+    }
+    base[env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR] = (
+        env_loader._encode_gateway_launch_env_lock(base, tmp_path / "code")
+    )
+    for key, value in {
+        "NODE_OPTIONS": "--require=poison.js",
+        "PYTHONSTARTUP": "poison.py",
+        "PYTHONHOME": "poison-home",
+        "BASH_ENV": "poison.sh",
+        "ENV": "poison-env.sh",
+        "SHELLOPTS": "xtrace",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    child = gateway_windows._managed_gateway_child_environment(base)
+
+    assert child["PATH"] == runtime_path
+    assert child["SystemRoot"] == str(windows_dir)
+    assert child[env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR] == base[
+        env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR
+    ]
+    for hostile in (
+        "NODE_OPTIONS",
+        "PYTHONSTARTUP",
+        "PYTHONHOME",
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+    ):
+        assert hostile not in child
+
+
+def test_gateway_launchers_keep_legacy_inherited_path_when_opt_in_is_absent(
+    monkeypatch,
+):
+    monkeypatch.delenv("HERMES_GATEWAY_RUNTIME_PATH", raising=False)
+    content = gateway_windows._build_gateway_cmd_script(
+        r"C:\Reviewed\venv\Scripts\python.exe",
+        r"C:\Reviewed",
+        r"C:\Runtime\home",
+        "",
+        code_root=r"C:\Reviewed",
+    )
+
+    assert 'set "HERMES_GATEWAY_RUNTIME_PATH=' not in content
+    assert 'set "PATH=' not in content
+
+
+@pytest.mark.parametrize(
+    "runtime_path",
+    [
+        "",
+        r"relative\bin;C:\Windows\System32",
+        r"C:\Reviewed\bin;;C:\Windows\System32",
+        r"C:\Reviewed\bin;C:\Reviewed\bin",
+        r"C:\Reviewed\..\poison",
+        r"C:\Reviewed\%POISON%",
+    ],
+)
+def test_gateway_runtime_path_rejects_unsafe_or_noncanonical_input(
+    monkeypatch, runtime_path
+):
+    _set_managed_launch_env(monkeypatch, runtime_path)
+
+    with pytest.raises(ValueError, match="HERMES_GATEWAY_RUNTIME_PATH"):
+        gateway_windows._gateway_runtime_path_overlay()
 
 
 def test_resolve_gateway_working_dir_ignores_inherited_override(monkeypatch, tmp_path):
@@ -564,6 +788,9 @@ def test_restart_spec_replaces_inherited_runtime_roots_and_working_dir(
     monkeypatch.setenv(
         "HERMES_GATEWAY_WORKING_DIR", str(tmp_path / "old-working-copy")
     )
+    reviewed_runtime_path = r"C:\Reviewed\bin;C:\Windows\System32"
+    monkeypatch.setenv("PATH", r"C:\poison")
+    managed_values = _set_managed_launch_env(monkeypatch, reviewed_runtime_path)
 
     argv, cwd, overlay = gateway_windows.windowless_gateway_restart_spec(
         [str(python_path), "-m", "hermes_cli.main", "gateway", "run"]
@@ -577,12 +804,19 @@ def test_restart_spec_replaces_inherited_runtime_roots_and_working_dir(
     assert overlay["GLADLY_HERMES_CODE_ROOT"] == str(project.resolve())
     assert str(tmp_path / "old-pythonpath") not in overlay["PYTHONPATH"]
     assert "old-working-copy" not in cwd
+    assert overlay["PATH"] == reviewed_runtime_path
+    assert overlay["HERMES_GATEWAY_RUNTIME_PATH"] == reviewed_runtime_path
     lock_values, lock_cwd = env_loader._decode_gateway_launch_env_lock(
         overlay[env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR]
     )
     assert lock_values == {
-        key: overlay[key] for key in env_loader._GATEWAY_LAUNCH_ENV_KEYS
+        key: overlay[key]
+        for key in (
+            *env_loader._GATEWAY_LAUNCH_ENV_KEYS,
+            *env_loader._GATEWAY_MANAGED_LAUNCH_ENV_KEYS,
+        )
     }
+    assert {key: overlay[key] for key in managed_values} == managed_values
     assert lock_cwd == cwd
 
 
@@ -694,6 +928,41 @@ def test_restart_watcher_refuses_unlocked_windows_respawn(monkeypatch):
 
 
 @pytest.mark.windows_only
+def test_restart_watcher_refuses_runtime_path_opt_in_without_sealed_path(
+    monkeypatch, tmp_path
+):
+    reviewed = tmp_path / "reviewed"
+    reviewed.mkdir()
+    monkeypatch.setenv(
+        "HERMES_GATEWAY_RUNTIME_PATH",
+        r"C:\Reviewed\bin;C:\Windows\System32",
+    )
+    incomplete = {
+        "HERMES_HOME": str(tmp_path / "home"),
+        "HERMES_RUNTIME_HOME": str(tmp_path / "home"),
+        "GLADLY_HERMES_CODE_ROOT": str(reviewed),
+        "PYTHONPATH": str(reviewed),
+        "VIRTUAL_ENV": str(tmp_path / "venv"),
+        env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR: "locked-marker",
+    }
+    monkeypatch.setattr(
+        gateway_windows,
+        "windowless_gateway_restart_spec",
+        lambda argv: (list(argv), str(reviewed), incomplete),
+    )
+    monkeypatch.setattr(
+        gateway.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("unsealed watcher was spawned"),
+    )
+
+    assert gateway._spawn_gateway_restart_watcher(
+        1234,
+        ["python.exe", "-m", "hermes_cli.main", "gateway", "run"],
+    ) is False
+
+
+@pytest.mark.windows_only
 def test_restart_watcher_process_is_pinned_on_primary_and_fallback_spawn(
     monkeypatch, tmp_path
 ):
@@ -740,6 +1009,53 @@ def test_restart_watcher_process_is_pinned_on_primary_and_fallback_spawn(
         assert "HERMES_GATEWAY_WORKING_DIR" not in kwargs["env"]
 
 
+@pytest.mark.windows_only
+def test_managed_restart_watcher_environment_is_allowlisted(monkeypatch, tmp_path):
+    windows_dir = gateway_windows._windows_directory()
+    runtime_path = f"{Path(sys.executable).parent};{windows_dir / 'System32'}"
+    managed = _set_managed_launch_env(monkeypatch, runtime_path)
+    reviewed = tmp_path / "reviewed"
+    home = tmp_path / "home"
+    reviewed.mkdir()
+    home.mkdir()
+    overlay = {
+        "HERMES_HOME": str(home),
+        "HERMES_RUNTIME_HOME": str(home),
+        "GLADLY_HERMES_CODE_ROOT": str(reviewed),
+        "PYTHONPATH": str(reviewed),
+        "VIRTUAL_ENV": str(tmp_path / "venv"),
+        **managed,
+    }
+    overlay[env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR] = (
+        env_loader._encode_gateway_launch_env_lock(overlay, reviewed)
+    )
+    monkeypatch.setenv("NODE_OPTIONS", "--require=poison.js")
+    monkeypatch.setenv("BASH_ENV", "poison.sh")
+    monkeypatch.setattr(
+        gateway_windows,
+        "windowless_gateway_restart_spec",
+        lambda argv: (list(argv), str(reviewed), dict(overlay)),
+    )
+    calls = []
+    monkeypatch.setattr(
+        gateway.subprocess,
+        "Popen",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or SimpleNamespace(),
+    )
+
+    assert gateway._spawn_gateway_restart_watcher(
+        1234,
+        [sys.executable, "-m", "hermes_cli.main", "gateway", "run"],
+    ) is True
+    watcher_env = calls[0][1]["env"]
+    assert watcher_env["PATH"] == runtime_path
+    assert watcher_env[env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR] == overlay[
+        env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR
+    ]
+    assert "NODE_OPTIONS" not in watcher_env
+    assert "BASH_ENV" not in watcher_env
+
+
 def test_exec_schtasks_replaces_undecodable_localized_output(monkeypatch):
     calls = []
 
@@ -753,13 +1069,37 @@ def test_exec_schtasks_replaces_undecodable_localized_output(monkeypatch):
         return Result()
 
     monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
-    monkeypatch.setattr(gateway_windows.shutil, "which", lambda name: "schtasks.exe")
+    monkeypatch.setattr(
+        gateway_windows,
+        "_schtasks_executable",
+        lambda: r"C:\Windows\System32\schtasks.exe",
+    )
     monkeypatch.setattr(gateway_windows.subprocess, "run", fake_run)
 
     gateway_windows._exec_schtasks(["/Query", "/TN", "Hermes_Gateway"])
 
     assert calls[0][1]["text"] is True
     assert calls[0][1]["errors"] == "replace"
+
+
+@pytest.mark.windows_only
+def test_exec_schtasks_ignores_path_decoy(monkeypatch, tmp_path):
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    (decoy / "schtasks.exe").write_bytes(b"decoy")
+    monkeypatch.setenv("PATH", str(decoy))
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(gateway_windows.subprocess, "run", fake_run)
+
+    assert gateway_windows._exec_schtasks(["/Query"])[0] == 0
+    expected = gateway_windows._windows_directory() / "System32" / "schtasks.exe"
+    assert Path(calls[0][0][0]) == expected
+    assert Path(calls[0][0][0]) != decoy / "schtasks.exe"
 
 
 @pytest.mark.windows_only
@@ -917,6 +1257,66 @@ def test_gateway_vbs_script_is_console_less_and_pins_runtime(monkeypatch):
     assert content.endswith("\r\n")
 
 
+@pytest.mark.windows_only
+def test_sealed_task_xml_uses_exact_system32_wscript_despite_path_decoy(
+    monkeypatch, tmp_path
+):
+    system_root = Path(os.environ["SystemRoot"])
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    (decoy / "wscript.exe").write_text("decoy", encoding="utf-8")
+    reviewed_path = f"{decoy};{system_root / 'System32'}"
+    _set_managed_launch_env(monkeypatch, reviewed_path)
+
+    xml = gateway_windows._build_scheduled_task_xml(
+        "Hermes_Gateway",
+        tmp_path / "Hermes_Gateway.vbs",
+        None,
+        enabled=False,
+    )
+
+    expected = Path(gateway_windows._stable_system_executable("wscript.exe"))
+    assert f"<Command>{expected}</Command>" in xml
+    assert f"<Command>{decoy / 'wscript.exe'}</Command>" not in xml
+
+
+@pytest.mark.windows_only
+def test_task_xml_complete_renderer_allows_only_direct_settings_enabled_overlay(
+    monkeypatch,
+):
+    for key in env_loader._GATEWAY_MANAGED_LAUNCH_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    xml = gateway_windows._build_scheduled_task_xml(
+        gateway_windows.get_task_name(),
+        gateway_windows._expected_task_script_path().with_suffix(".vbs"),
+        gateway_windows._resolve_task_user(),
+        enabled=False,
+    )
+
+    assert gateway_windows._task_xml_matches_current_definition(xml)
+    enabled_xml = xml.replace(
+        "    <Enabled>false</Enabled>",
+        "    <Enabled>true</Enabled>",
+        1,
+    )
+    assert gateway_windows._task_xml_matches_current_definition(enabled_xml)
+
+    hostile_variants = (
+        xml.replace("<RunLevel>LeastPrivilege</RunLevel>", "<RunLevel>HighestAvailable</RunLevel>"),
+        xml.replace("<Delay>PT30S</Delay>", "<Delay>PT1S</Delay>"),
+        xml.replace("<StartWhenAvailable>true</StartWhenAvailable>", "<StartWhenAvailable>false</StartWhenAvailable>"),
+        xml.replace("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>", "<MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>"),
+        xml.replace("<Description>Hermes Agent", "<Description>Foreign Hermes Agent"),
+        xml.replace("<Actions Context=\"Author\">", "<Actions Context=\"Foreign\">"),
+        xml.replace("      <Enabled>true</Enabled>", "      <Enabled>false</Enabled>", 1),
+        xml.replace("<Arguments>//B", "<Arguments> //B"),
+    )
+    assert all(
+        not gateway_windows._task_xml_matches_current_definition(candidate)
+        for candidate in hostile_variants
+    )
+
+
 def test_elevated_install_propagates_disabled_flag(monkeypatch):
     calls = []
     monkeypatch.setattr(
@@ -1009,6 +1409,68 @@ def test_install_disabled_never_starts_and_registers_disabled(
     output = capsys.readouterr().out
     assert "installed but disabled" in output
     assert "Start manually" not in output
+
+
+@pytest.mark.windows_only
+def test_managed_runtime_rejects_raw_install_enable_and_direct_start(
+    monkeypatch,
+):
+    windows_dir = gateway_windows._windows_directory()
+    _set_managed_launch_env(
+        monkeypatch,
+        f"{Path(sys.executable).parent};{windows_dir / 'System32'}",
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_write_task_script",
+        lambda: pytest.fail("raw managed install reached a filesystem write"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_spawn_detached",
+        lambda *args, **kwargs: pytest.fail("raw managed start spawned a process"),
+    )
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
+    monkeypatch.setattr(gateway_windows, "_inspect_task_xml", lambda: "disabled")
+    monkeypatch.setattr(
+        gateway_windows,
+        "_task_xml_matches_current_definition",
+        lambda _xml: True,
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_task_xml_is_enabled",
+        lambda _xml: False,
+    )
+
+    with pytest.raises(RuntimeError, match="must remain disabled"):
+        gateway_windows.install(install_disabled=False)
+    with pytest.raises(RuntimeError, match="gateway-enable"):
+        gateway_windows.start()
+
+    task_calls = []
+    monkeypatch.setattr(
+        gateway_windows,
+        "_task_xml_is_enabled",
+        lambda _xml: True,
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_exec_schtasks",
+        lambda args: task_calls.append(args) or (0, "started", ""),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_report_gateway_start",
+        lambda via: task_calls.append([via]) or True,
+    )
+
+    gateway_windows.start()
+
+    assert task_calls == [
+        ["/Run", "/TN", gateway_windows.get_task_name()],
+        ["reviewed Scheduled Task"],
+    ]
 
 
 def test_disabled_scheduled_task_is_not_autostart_enabled(monkeypatch, tmp_path):
@@ -1106,6 +1568,10 @@ def test_is_installed_accepts_exact_current_task_action(monkeypatch, tmp_path):
     )
 
     assert gateway_windows.is_installed() is True
+    assert gateway_windows._task_xml_belongs_to_current_profile(
+        task_xml,
+        allow_legacy_task_action=False,
+    ) is True
 
 
 def test_task_ownership_rejects_extra_action_and_foreign_wscript(
@@ -1254,6 +1720,10 @@ def test_is_installed_accepts_exact_legacy_cmd_task_action(monkeypatch, tmp_path
     )
 
     assert gateway_windows.is_installed() is True
+    assert gateway_windows._task_xml_belongs_to_current_profile(
+        task_xml,
+        allow_legacy_task_action=False,
+    ) is False
 
 
 def test_startup_ownership_requires_exact_current_vbs_target(monkeypatch, tmp_path):

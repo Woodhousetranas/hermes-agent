@@ -31,13 +31,16 @@ import ctypes
 import csv
 import locale
 import logging
+import ntpath
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -92,6 +95,182 @@ def _schtasks_encoding() -> str:
 def _assert_windows() -> None:
     if sys.platform != "win32":
         raise RuntimeError("gateway_windows is Windows-only")
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = (
+        ("Data1", ctypes.c_uint32),
+        ("Data2", ctypes.c_uint16),
+        ("Data3", ctypes.c_uint16),
+        ("Data4", ctypes.c_ubyte * 8),
+    )
+
+
+_FOLDERID_STARTUP = _GUID(
+    0xB97D20BB,
+    0xF46A,
+    0x4C97,
+    (ctypes.c_ubyte * 8)(0xBA, 0x10, 0x5E, 0x36, 0x08, 0x43, 0x08, 0x54),
+)
+_FOLDERID_PROFILE = _GUID(
+    0x5E6C858F,
+    0x0E22,
+    0x4760,
+    (ctypes.c_ubyte * 8)(0x9A, 0xFE, 0xEA, 0x33, 0x17, 0xB6, 0x71, 0x73),
+)
+_FOLDERID_ROAMING_APPDATA = _GUID(
+    0x3EB685DB,
+    0x65F9,
+    0x4CF6,
+    (ctypes.c_ubyte * 8)(0xA0, 0x3A, 0xE3, 0xEF, 0x65, 0x72, 0x9F, 0x3D),
+)
+_FOLDERID_LOCAL_APPDATA = _GUID(
+    0xF1B32785,
+    0x6FBA,
+    0x4FCF,
+    (ctypes.c_ubyte * 8)(0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91),
+)
+
+
+def _windows_directory() -> Path:
+    """Resolve the Windows directory from Kernel32, never mutable env."""
+    _assert_windows()
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = ctypes.windll.kernel32.GetWindowsDirectoryW(buffer, len(buffer))
+    if length <= 0 or length >= len(buffer):
+        raise RuntimeError("GetWindowsDirectoryW failed")
+    path = Path(buffer.value)
+    if not path.is_absolute():
+        raise RuntimeError("GetWindowsDirectoryW returned a non-absolute path")
+    return path
+
+
+def _known_folder_path(folder_id: _GUID, label: str) -> Path:
+    """Resolve a per-user path through SHGetKnownFolderPath."""
+    _assert_windows()
+    output = ctypes.c_wchar_p()
+    status = ctypes.windll.shell32.SHGetKnownFolderPath(
+        ctypes.byref(folder_id),
+        0,
+        None,
+        ctypes.byref(output),
+    )
+    try:
+        if status != 0 or not output.value:
+            raise RuntimeError(f"SHGetKnownFolderPath({label}) failed: {status}")
+        path = Path(output.value)
+        if not path.is_absolute():
+            raise RuntimeError(f"SHGetKnownFolderPath({label}) returned a non-absolute path")
+        return path
+    finally:
+        if output:
+            ctypes.windll.ole32.CoTaskMemFree(ctypes.cast(output, ctypes.c_void_p))
+
+
+def _stable_system_executable(name: str) -> str:
+    """Return an exact System32 executable after a closed-handle identity read."""
+    path = _windows_directory() / "System32" / name
+    before_path = path.lstat()
+    if stat.S_ISLNK(before_path.st_mode) or not stat.S_ISREG(before_path.st_mode):
+        raise RuntimeError(f"reviewed System32 executable is not a regular file: {path}")
+    if bool(getattr(before_path, "st_file_attributes", 0) & 0x400):
+        raise RuntimeError(f"reviewed System32 executable is a reparse point: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened_before = os.fstat(descriptor)
+        while os.read(descriptor, 1024 * 1024):
+            pass
+        opened_after = os.fstat(descriptor)
+        after_path = path.lstat()
+    finally:
+        os.close(descriptor)
+    identity = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+        getattr(value, "st_file_attributes", 0),
+    )
+    if len({identity(before_path), identity(opened_before), identity(opened_after), identity(after_path)}) != 1:
+        raise RuntimeError(f"reviewed System32 executable changed during validation: {path}")
+    if stat.S_ISLNK(after_path.st_mode) or bool(
+        getattr(after_path, "st_file_attributes", 0) & 0x400
+    ):
+        raise RuntimeError(f"reviewed System32 executable became a reparse point: {path}")
+    return str(path.resolve(strict=True))
+
+
+def _schtasks_executable() -> str:
+    return _stable_system_executable("schtasks.exe")
+
+
+def _trusted_windows_child_environment(runtime_path: str) -> dict[str, str]:
+    """Return Windows process primitives derived only from OS APIs.
+
+    Managed launchers do not inherit mutable ``SystemRoot``, profile, AppData,
+    temp, ComSpec, or hook variables from the shell that staged/started them.
+    """
+    windows_dir = _windows_directory()
+    profile = _known_folder_path(_FOLDERID_PROFILE, "Profile")
+    roaming = _known_folder_path(_FOLDERID_ROAMING_APPDATA, "RoamingAppData")
+    local = _known_folder_path(_FOLDERID_LOCAL_APPDATA, "LocalAppData")
+    return {
+        "SystemRoot": str(windows_dir),
+        "WINDIR": str(windows_dir),
+        "USERPROFILE": str(profile),
+        "HOME": str(profile),
+        "APPDATA": str(roaming),
+        "LOCALAPPDATA": str(local),
+        "TEMP": str(local / "Temp"),
+        "TMP": str(local / "Temp"),
+        "ComSpec": _stable_system_executable("cmd.exe"),
+        "PATHEXT": ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC",
+        "PATH": runtime_path,
+    }
+
+
+def _managed_gateway_child_environment(
+    launch_values: Mapping[str, str],
+) -> dict[str, str]:
+    """Build the complete allowlisted environment for one managed child.
+
+    This function deliberately starts from an empty mapping.  Provider secrets
+    and operator configuration are loaded by Hermes from its reviewed runtime
+    home after Python starts; ambient shell variables, Python/Node/Bash hooks,
+    path decoys, and stale checkout pointers never cross the process boundary.
+    """
+    from hermes_cli.env_loader import (
+        _GATEWAY_LAUNCH_ENV_KEYS,
+        _GATEWAY_LAUNCH_ENV_LOCK_VAR,
+        _GATEWAY_MANAGED_LAUNCH_ENV_KEYS,
+        _validate_gateway_managed_launch_values,
+    )
+
+    managed = _validate_gateway_managed_launch_values(launch_values)
+    child = _trusted_windows_child_environment(managed["PATH"])
+    allowed = {
+        *_GATEWAY_LAUNCH_ENV_KEYS,
+        *_GATEWAY_MANAGED_LAUNCH_ENV_KEYS,
+        _GATEWAY_LAUNCH_ENV_LOCK_VAR,
+        "LANG",
+        "LC_ALL",
+        "PYTHONUTF8",
+        "PYTHONIOENCODING",
+        "HERMES_GATEWAY_DETACHED",
+        _WINDOWS_GATEWAY_BREAKAWAY_ENV,
+    }
+    for key in allowed:
+        value = launch_values.get(key)
+        if isinstance(value, str) and value:
+            child[key] = value
+    # The reviewed runtime policy is authoritative even if a caller omitted
+    # PATH from an intermediate overlay (validation above normally rejects it).
+    child.update(managed)
+    return child
 
 
 def _preserve_hermes_home_path(path: str | Path) -> str:
@@ -162,9 +341,10 @@ def _exec_schtasks(args: list[str]) -> tuple[int, str, str]:
     same convention OpenClaw uses, so the fallback detection regex matches.
     """
     _assert_windows()
-    schtasks = shutil.which("schtasks")
-    if schtasks is None:
-        return (1, "", "schtasks.exe not found on PATH")
+    try:
+        schtasks = _schtasks_executable()
+    except (OSError, RuntimeError) as exc:
+        return (1, "", f"reviewed schtasks.exe is unavailable: {exc}")
     try:
         proc = subprocess.run(
             [schtasks, *args],
@@ -411,22 +591,7 @@ def _expected_task_script_path() -> Path:
 
 
 def _startup_dir() -> Path:
-    appdata = os.environ.get("APPDATA", "").strip()
-    if appdata:
-        return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
-    userprofile = os.environ.get("USERPROFILE", "").strip() or os.environ.get("HOME", "").strip()
-    if not userprofile:
-        raise RuntimeError("neither APPDATA nor USERPROFILE is set — cannot resolve Startup folder")
-    return (
-        Path(userprofile)
-        / "AppData"
-        / "Roaming"
-        / "Microsoft"
-        / "Windows"
-        / "Start Menu"
-        / "Programs"
-        / "Startup"
-    )
+    return _known_folder_path(_FOLDERID_STARTUP, "Startup")
 
 
 def get_startup_entry_path() -> Path:
@@ -489,6 +654,118 @@ def _add_gateway_launch_env_lock(
     return _GATEWAY_LAUNCH_ENV_LOCK_VAR
 
 
+def _gateway_runtime_path_overlay() -> dict[str, str]:
+    """Return the opt-in, immutable Windows runtime PATH overlay.
+
+    Standalone Hermes keeps its historical inherited-PATH behaviour when the
+    input is absent.  A managed install that provides the input gets the exact
+    same value baked into both the public source variable and ``PATH`` for
+    every launcher/respawn path.  Validation is intentionally syntactic here;
+    the embedding runtime owns directory existence and payload attestation.
+    """
+    name = "HERMES_GATEWAY_RUNTIME_PATH"
+    if name not in os.environ:
+        return {}
+    value = os.environ[name]
+    if (
+        not value
+        or any(char in value for char in ("\x00", "\r", "\n", '"', "%", "!"))
+    ):
+        raise ValueError(f"{name} is empty or unsafe for a Windows launcher")
+
+    entries = value.split(";")
+    if any(not entry or entry != entry.strip() for entry in entries):
+        raise ValueError(f"{name} must contain non-empty unpadded path entries")
+    normalized: set[str] = set()
+    for entry in entries:
+        if not ntpath.isabs(entry):
+            raise ValueError(f"{name} contains a non-absolute path entry: {entry!r}")
+        if any(part in {".", ".."} for part in entry.replace("/", "\\").split("\\")):
+            raise ValueError(f"{name} contains a relative path segment: {entry!r}")
+        key = ntpath.normcase(ntpath.normpath(entry))
+        if key in normalized:
+            raise ValueError(f"{name} contains a duplicate path entry: {entry!r}")
+        normalized.add(key)
+    return {name: value, "PATH": value}
+
+
+def _gateway_managed_launch_overlay() -> dict[str, str]:
+    """Return the complete managed path + validator provenance.
+
+    Gladly embedding is detected from the imported checkout. Public variables
+    may confirm that contract, but their absence can never downgrade a managed
+    install into the standalone launcher path.
+    """
+    from hermes_cli.env_loader import (
+        _GATEWAY_MANAGED_PROVENANCE_ENV_KEYS,
+        _managed_install_contract,
+        _same_evidence_path,
+        _validate_gateway_managed_launch_values,
+    )
+
+    contract = _managed_install_contract()
+    opt_in_keys = (
+        "HERMES_GATEWAY_RUNTIME_PATH",
+        *_GATEWAY_MANAGED_PROVENANCE_ENV_KEYS,
+    )
+    if contract is None and not any(key in os.environ for key in opt_in_keys):
+        return {}
+    if contract is not None:
+        expected = contract.get("managedValues")
+        if not isinstance(expected, dict):
+            raise ValueError("managed Gladly install contract is incomplete")
+        for key in opt_in_keys:
+            supplied = os.environ.get(key)
+            if supplied is None:
+                continue
+            expected_value = expected.get(key)
+            if key == "HERMES_GATEWAY_START_VALIDATOR":
+                if not isinstance(expected_value, str) or not _same_evidence_path(
+                    supplied,
+                    expected_value,
+                ):
+                    raise ValueError(
+                        "public managed validator redirects outside the receipt-bound install"
+                    )
+            elif supplied != expected_value:
+                raise ValueError(f"public managed launch value {key} differs from receipt evidence")
+        return _validate_gateway_managed_launch_values(expected)
+    # Keep the path-specific diagnostics from the renderer, then apply the
+    # complete v3 contract (which rejects partial provenance and mismatches).
+    _gateway_runtime_path_overlay()
+    return _validate_gateway_managed_launch_values(os.environ)
+
+
+def _gateway_task_interpreter() -> str:
+    """Return the task's reviewed VBScript interpreter.
+
+    Legacy/standalone installs keep the historical system-resolved basename.
+    A sealed managed runtime uses the exact System32 executable and requires
+    that directory to be present in its reviewed PATH policy.
+    """
+    overlay = _gateway_managed_launch_overlay()
+    if not overlay:
+        return "wscript.exe"
+    interpreter = _stable_system_executable("wscript.exe")
+    system32 = ntpath.normcase(ntpath.dirname(interpreter))
+    reviewed_directories = {
+        ntpath.normcase(ntpath.normpath(entry))
+        for entry in overlay["PATH"].split(";")
+    }
+    if system32 not in reviewed_directories:
+        raise ValueError("sealed gateway PATH does not contain System32")
+    path = Path(interpreter)
+    try:
+        status = path.lstat()
+    except OSError as exc:
+        raise ValueError("sealed gateway task interpreter is missing") from exc
+    if path.is_symlink() or not path.is_file() or bool(
+        getattr(status, "st_file_attributes", 0) & 0x400
+    ):
+        raise ValueError("sealed gateway task interpreter is not a regular file")
+    return str(path)
+
+
 def _build_gateway_cmd_script(
     python_path: str,
     working_dir: str,
@@ -511,11 +788,32 @@ def _build_gateway_cmd_script(
     in a real terminal, the console interpreter keeps the gateway attached
     to that terminal like a normal foreground ``hermes gateway run``.
 
-    We intentionally do NOT inline PATH overrides here — cmd.exe inherits
-    the per-user PATH the Scheduled Task was created with, and forcibly
-    rewriting PATH tends to break Homebrew/nvm-style installations.
+    Standalone installs retain the inherited PATH. Managed installs may set
+    ``HERMES_GATEWAY_RUNTIME_PATH`` to opt into an exact, immutable PATH that
+    is rendered and launch-locked here.
     """
     lines = ["@echo off", f"rem {_TASK_DESCRIPTION}"]
+    managed_overlay = _gateway_managed_launch_overlay()
+    if managed_overlay:
+        # The compatibility CMD artifact must not start Python with its ambient
+        # cmd.exe environment. Route it through the exact reviewed wscript +
+        # sibling VBS launcher; that launcher builds a from-empty allowlist
+        # before it creates the gateway process. Scheduled Task/ONLOGON already
+        # enters through this same VBS path directly.
+        interpreter = _gateway_task_interpreter()
+        lines.append(
+            " ".join(
+                (
+                    _quote_cmd_script_arg(interpreter),
+                    "//B",
+                    "//Nologo",
+                    '"%~dpn0.vbs"',
+                )
+            )
+        )
+        lines.append("exit /b %errorlevel%")
+        return "\r\n".join(lines) + "\r\n"
+
     lines.append(f"cd /d {_quote_cmd_script_arg(working_dir)}")
     code_root = code_root or _preserve_hermes_home_path(
         Path(__file__).resolve().parent.parent
@@ -547,6 +845,11 @@ def _build_gateway_cmd_script(
         "PYTHONPATH": static_pythonpath,
         "VIRTUAL_ENV": _preserve_hermes_home_path(venv_dir),
     }
+    runtime_path_overlay = managed_overlay
+    launch_env.update(runtime_path_overlay)
+    for key in ("HERMES_GATEWAY_RUNTIME_PATH", "PATH"):
+        if key in runtime_path_overlay:
+            lines.append(f'set "{key}={runtime_path_overlay[key]}"')
     lock_name = _add_gateway_launch_env_lock(launch_env, working_dir)
     lock_value = launch_env[lock_name]
     lines.append(f'set "{lock_name}={lock_value}"')
@@ -626,8 +929,64 @@ def _build_gateway_vbs_script(
         "PYTHONPATH": static_pythonpath,
         "VIRTUAL_ENV": _preserve_hermes_home_path(venv_dir),
     }
+    runtime_path_overlay = _gateway_managed_launch_overlay()
+    launch_env.update(runtime_path_overlay)
     lock_name = _add_gateway_launch_env_lock(launch_env, working_dir)
     lock_value = launch_env[lock_name]
+
+    if runtime_path_overlay:
+        complete_launch_values = {
+            **launch_env,
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
+            "HERMES_GATEWAY_DETACHED": "1",
+        }
+        child_env = _managed_gateway_child_environment(complete_launch_values)
+        allowed_names = "|" + "|".join(
+            sorted((key.upper() for key in child_env), key=str.casefold)
+        ) + "|"
+        lines = [
+            f"' {_TASK_DESCRIPTION}",
+            "Option Explicit",
+            "Dim sh, env, inheritedEntry, inheritedName, equalsAt, keyCount, keyIndex, allowedNames",
+            "Dim inheritedKeys()",
+            'Set sh = CreateObject("WScript.Shell")',
+            'Set env = sh.Environment("PROCESS")',
+            "keyCount = -1",
+            "For Each inheritedEntry In env",
+            '  equalsAt = InStr(2, inheritedEntry, "=")',
+            "  If equalsAt > 1 Then",
+            "    inheritedName = Left(inheritedEntry, equalsAt - 1)",
+            "    keyCount = keyCount + 1",
+            "    ReDim Preserve inheritedKeys(keyCount)",
+            "    inheritedKeys(keyCount) = inheritedName",
+            "  End If",
+            "Next",
+            "On Error Resume Next",
+            "For keyIndex = 0 To keyCount",
+            "  env.Remove inheritedKeys(keyIndex)",
+            "Next",
+            "On Error GoTo 0",
+            *[
+                f"env.Item({_quote_vbs_string(key)}) = {_quote_vbs_string(value)}"
+                for key, value in sorted(child_env.items(), key=lambda item: item[0].casefold())
+            ],
+            f"allowedNames = {_quote_vbs_string(allowed_names)}",
+            "For Each inheritedEntry In env",
+            '  equalsAt = InStr(2, inheritedEntry, "=")',
+            "  If equalsAt > 1 Then",
+            "    inheritedName = Left(inheritedEntry, equalsAt - 1)",
+            '    If InStr(1, allowedNames, "|" & UCase(inheritedName) & "|", 1) = 0 Then',
+            "      WScript.Quit 87",
+            "    End If",
+            "  End If",
+            "Next",
+            f"sh.CurrentDirectory = {_quote_vbs_string(working_dir)}",
+            f"sh.Run {_quote_vbs_string(command_line)}, 0, False",
+        ]
+        return "\r\n".join(lines) + "\r\n"
 
     lines = [
         f"' {_TASK_DESCRIPTION}",
@@ -647,6 +1006,11 @@ def _build_gateway_vbs_script(
         # Replace, rather than extend, inherited PYTHONPATH.  This prevents a
         # stale user/worktree path from shadowing the reviewed install.
         f"env.Item({_quote_vbs_string('PYTHONPATH')}) = {_quote_vbs_string(static_pythonpath)}",
+        *[
+            f"env.Item({_quote_vbs_string(key)}) = {_quote_vbs_string(runtime_path_overlay[key])}"
+            for key in ("HERMES_GATEWAY_RUNTIME_PATH", "PATH")
+            if key in runtime_path_overlay
+        ],
         f"env.Item({_quote_vbs_string(lock_name)}) = {_quote_vbs_string(lock_value)}",
         f"sh.CurrentDirectory = {_quote_vbs_string(working_dir)}",
         # Window style 0 = hidden; bWaitOnReturn False = detached/async. The
@@ -931,7 +1295,28 @@ def _write_task_script() -> Path:
 # ---------------------------------------------------------------------------
 
 def _resolve_task_user() -> str | None:
-    """Return ``DOMAIN\\USER`` if available, else bare USERNAME, else None."""
+    """Return the current Windows identity without trusting mutable env."""
+    if sys.platform == "win32":
+        # NameSamCompatible returns DOMAIN\\USER and is accepted by Task
+        # Scheduler. The first call obtains the required UTF-16 buffer size.
+        required = ctypes.c_ulong(0)
+        ctypes.windll.secur32.GetUserNameExW(2, None, ctypes.byref(required))
+        if required.value:
+            buffer = ctypes.create_unicode_buffer(required.value)
+            if ctypes.windll.secur32.GetUserNameExW(
+                2, buffer, ctypes.byref(required)
+            ):
+                value = buffer.value.strip()
+                if value:
+                    return value
+        required = ctypes.c_ulong(32768)
+        buffer = ctypes.create_unicode_buffer(required.value)
+        if ctypes.windll.advapi32.GetUserNameW(buffer, ctypes.byref(required)):
+            value = buffer.value.strip()
+            if value:
+                return value
+
+    # Keep imports and host-independent tests functional off Windows.
     username = os.environ.get("USERNAME") or os.environ.get("USER") or os.environ.get("LOGNAME")
     if not username:
         return None
@@ -956,6 +1341,7 @@ def _build_scheduled_task_xml(
     """
     user_principal = f"\n      <UserId>{escape(user)}</UserId>" if user else ""
     task_enabled = "true" if enabled else "false"
+    task_interpreter = _gateway_task_interpreter()
     return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -998,7 +1384,7 @@ def _build_scheduled_task_xml(
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>wscript.exe</Command>
+      <Command>{escape(task_interpreter)}</Command>
       <Arguments>//B //Nologo "{escape(str(launcher_path))}"</Arguments>
     </Exec>
   </Actions>
@@ -1242,6 +1628,7 @@ def _build_gateway_argv() -> tuple[list[str], str, dict[str, str]]:
         if extra_pythonpath
         else [project_root],
     )
+    env_overlay.update(_gateway_managed_launch_overlay())
     _add_gateway_launch_env_lock(env_overlay, working_dir)
     return argv, working_dir, env_overlay
 
@@ -1340,6 +1727,7 @@ def windowless_gateway_restart_spec(
         env_overlay,
         [project_root, *extra_pythonpath] if extra_pythonpath else [project_root],
     )
+    env_overlay.update(_gateway_managed_launch_overlay())
     _add_gateway_launch_env_lock(env_overlay, working_dir)
     return new_argv, working_dir, env_overlay
 
@@ -1367,8 +1755,14 @@ def _spawn_detached(script_path: Path | None = None) -> int:
     _assert_windows()
     argv, working_dir, env_overlay = _build_gateway_argv()
 
-    # Inherit PATH etc. from the current env, overlay our required vars.
-    env = {**os.environ, **env_overlay}
+    # Generic installs retain their historical ambient environment. Managed
+    # installs start from an OS-derived allowlist so shell hooks, path decoys,
+    # stale checkout pointers, and ambient provider secrets cannot cross the
+    # gateway process boundary.
+    if "HERMES_GATEWAY_RUNTIME_PATH" in env_overlay:
+        env = _managed_gateway_child_environment(env_overlay)
+    else:
+        env = {**os.environ, **env_overlay}
     primary_env = {**env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "1"}
 
     # CREATE_NEW_PROCESS_GROUP 0x00000200 — child gets its own group, won't
@@ -1516,6 +1910,14 @@ def install(
     / ``systemd_install`` but isn't needed — we always reconcile.
     """
     _assert_windows()
+    managed_launch = _gateway_managed_launch_overlay()
+    if managed_launch and not install_disabled:
+        raise RuntimeError(
+            "Managed Gladly gateway installs must remain disabled. Stage with "
+            "`hermes gateway install --install-disabled`, then use the Gladly "
+            "runtime gateway-enable command so manifest/task evidence is "
+            "checked with compare-and-swap before Settings/Enabled changes."
+        )
     if install_disabled:
         # A disabled staging install always creates login persistence but must
         # never start the gateway.  Safety wins over contradictory CLI flags.
@@ -1650,7 +2052,10 @@ def install(
         print(f"  Task script: {script_path}")
         if install_disabled:
             print("ℹ Gateway Scheduled Task is installed but disabled; it cannot auto-start or run on demand.")
-            print("  Re-run 'hermes gateway install' without --install-disabled to enable it.")
+            if managed_launch:
+                print("  Enable only with: bin/gladly runtime gateway-enable")
+            else:
+                print("  Re-run 'hermes gateway install' without --install-disabled to enable it.")
         else:
             print("ℹ Gateway auto-start installed for Windows login.")
         if not install_disabled:
@@ -1856,8 +2261,17 @@ def _same_windows_path(left: str | Path, right: str | Path) -> bool:
         return False
 
 
-def _task_xml_belongs_to_current_profile(xml_text: str) -> bool:
-    """Prove that a task's sole Exec action targets this profile's launcher."""
+def _task_xml_belongs_to_current_profile(
+    xml_text: str,
+    *,
+    allow_legacy_task_action: bool = True,
+) -> bool:
+    """Prove that a task's sole Exec action targets this profile's launcher.
+
+    Install/uninstall migration may recognize the exact pre-VBS CMD action.
+    Runtime attestation sets ``allow_legacy_task_action=False`` so only the
+    current VBS action and reviewed interpreter can enter a sealed manifest.
+    """
     try:
         from xml.etree import ElementTree
 
@@ -1889,7 +2303,8 @@ def _task_xml_belongs_to_current_profile(xml_text: str) -> bool:
         # /TR. Recognize that exact current-profile path so updates can migrate
         # the legacy artifact, without accepting a same-name foreign task.
         if (
-            set(fields) == {"Command"}
+            allow_legacy_task_action
+            and set(fields) == {"Command"}
             and _same_windows_path(command, expected_script)
         ):
             return _gateway_launcher_belongs_to_current_install(expected_script)
@@ -1898,7 +2313,11 @@ def _task_xml_belongs_to_current_profile(xml_text: str) -> bool:
         # it ends in wscript.exe lets a foreign executable pass ownership.
         if set(fields) != {"Command", "Arguments"}:
             return False
-        if command.casefold() != "wscript.exe":
+        expected_interpreter = _gateway_task_interpreter()
+        if expected_interpreter.casefold() == "wscript.exe":
+            if command.casefold() != "wscript.exe":
+                return False
+        elif not _same_windows_path(command, expected_interpreter):
             return False
         match = re.fullmatch(
             r'//B\s+//Nologo\s+"([^"]+)"',
@@ -1911,6 +2330,79 @@ def _task_xml_belongs_to_current_profile(xml_text: str) -> bool:
         return _same_windows_path(
             match.group(1), expected_vbs
         ) and _gateway_launcher_belongs_to_current_install(expected_vbs)
+    except (ElementTree.ParseError, OSError, RuntimeError, ValueError):
+        return False
+
+
+def _task_xml_semantic_identity(element) -> tuple:
+    """Return a formatting-independent, order-sensitive XML identity."""
+    children = list(element)
+    text = element.text or ""
+    # Ignore only renderer/Task Scheduler indentation. Leaf values stay byte-
+    # exact so leading/trailing spaces in Command, Arguments, UserId, policy
+    # values, etc. cannot hide behind a generic ``strip()`` normalization.
+    if children and not text.strip():
+        text = ""
+    tail = element.tail or ""
+    if not tail.strip():
+        tail = ""
+    return (
+        element.tag,
+        tuple(sorted(element.attrib.items())),
+        text,
+        tail,
+        tuple(_task_xml_semantic_identity(child) for child in children),
+    )
+
+
+def _task_xml_matches_current_definition(
+    xml_text: str,
+    *,
+    allow_settings_enabled_overlay: bool = True,
+) -> bool:
+    """Compare the complete task XML to the exact current renderer.
+
+    Task Scheduler may reformat XML, so comparison is semantic rather than
+    byte-based. Every element, attribute, text value, namespace, and child
+    order must match the renderer. The sole permitted runtime overlay is the
+    direct ``Task/Settings/Enabled`` value; trigger ``Enabled`` values and all
+    other policy/principal/action fields remain exact.
+    """
+    try:
+        from xml.etree import ElementTree
+
+        actual_root = ElementTree.fromstring(xml_text)
+        namespace = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
+        if actual_root.tag != f"{namespace}Task":
+            return False
+        settings = [
+            child for child in list(actual_root) if child.tag == f"{namespace}Settings"
+        ]
+        if len(settings) != 1:
+            return False
+        direct_enabled = [
+            child
+            for child in list(settings[0])
+            if child.tag == f"{namespace}Enabled"
+        ]
+        if len(direct_enabled) != 1:
+            return False
+        enabled_text = (direct_enabled[0].text or "").strip().casefold()
+        if enabled_text not in {"true", "false"}:
+            return False
+        expected_enabled = enabled_text == "true"
+        if not allow_settings_enabled_overlay and not expected_enabled:
+            return False
+        expected_xml = _build_scheduled_task_xml(
+            get_task_name(),
+            _expected_task_script_path().with_suffix(".vbs"),
+            _resolve_task_user(),
+            enabled=expected_enabled,
+        )
+        expected_root = ElementTree.fromstring(expected_xml)
+        return _task_xml_semantic_identity(actual_root) == _task_xml_semantic_identity(
+            expected_root
+        )
     except (ElementTree.ParseError, OSError, RuntimeError, ValueError):
         return False
 
@@ -1972,6 +2464,11 @@ def _owned_task_xml() -> str | None:
     except _TaskInspectionError:
         return None
     if out is None or not _task_xml_belongs_to_current_profile(out):
+        return None
+    if _gateway_managed_launch_overlay() and not _task_xml_matches_current_definition(
+        out,
+        allow_settings_enabled_overlay=True,
+    ):
         return None
     return out
 
@@ -2439,9 +2936,37 @@ def status(deep: bool = False) -> None:
 def start() -> None:
     """Start the gateway using the canonical detached Windows launch path."""
     _assert_windows()
+    managed_launch = _gateway_managed_launch_overlay()
     running_pids = _gateway_pids()
     if running_pids:
         print(f"✓ Gateway already running (PID: {', '.join(map(str, running_pids))})")
+        return
+
+    if managed_launch:
+        # A managed start may never bypass the disabled Scheduled Task through
+        # the historical direct spawn path. The parent runtime CLI owns the
+        # compare-and-swap that flips only Settings/Enabled. Once enabled, run
+        # the exact reviewed task: ONLOGON/manual start then converge on the
+        # same VBS allowlist + process-start validator.
+        task_xml = _inspect_task_xml()
+        if task_xml is None or not _task_xml_matches_current_definition(task_xml):
+            raise RuntimeError(
+                "Managed Gladly Scheduled Task evidence is absent or drifted; "
+                "refusing to start. Re-run runtime preparation."
+            )
+        if not _task_xml_is_enabled(task_xml):
+            raise RuntimeError(
+                "Managed Gladly Scheduled Task is disabled. Run "
+                "`bin/gladly runtime gateway-enable` before starting it."
+            )
+        code, out, err = _exec_schtasks(["/Run", "/TN", get_task_name()])
+        if code != 0:
+            detail = (err or out or "").strip()
+            raise RuntimeError(
+                "Managed Gladly Scheduled Task could not be started: "
+                f"{detail or f'schtasks exited {code}'}"
+            )
+        _report_gateway_start("reviewed Scheduled Task")
         return
 
     task_installed = _owned_task_xml() is not None
@@ -2638,6 +3163,11 @@ def restart() -> None:
     doesn't produce a running gateway.
     """
     _assert_windows()
+    if _gateway_managed_launch_overlay():
+        raise RuntimeError(
+            "Managed Gladly gateway restart is authority-controlled. Use the "
+            "Gladly runtime workflow; raw restart cannot bypass task evidence."
+        )
 
     stop()
 

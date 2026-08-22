@@ -5,9 +5,14 @@ from __future__ import annotations
 import base64
 import binascii
 import codecs
+import hashlib
 import io
 import json
+import ntpath
 import os
+import re
+import stat
+import subprocess
 import sys
 import threading
 from collections.abc import Mapping
@@ -71,10 +76,539 @@ _GATEWAY_LAUNCH_ENV_KEYS: tuple[str, ...] = (
     "PYTHONPATH",
     "VIRTUAL_ENV",
 )
+_GATEWAY_RUNTIME_PATH_ENV_KEYS: tuple[str, ...] = (
+    "HERMES_GATEWAY_RUNTIME_PATH",
+    "PATH",
+)
+_GATEWAY_MANAGED_PROVENANCE_ENV_KEYS: tuple[str, ...] = (
+    "HERMES_GATEWAY_START_VALIDATOR",
+    "HERMES_GATEWAY_START_VALIDATOR_ARGS",
+)
+_GATEWAY_MANAGED_LAUNCH_ENV_KEYS: tuple[str, ...] = (
+    *_GATEWAY_RUNTIME_PATH_ENV_KEYS,
+    *_GATEWAY_MANAGED_PROVENANCE_ENV_KEYS,
+)
+_SHA256_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _GATEWAY_LAUNCH_ENV_CAPTURE_MUTEX = threading.Lock()
 _GATEWAY_LAUNCH_ENV_CAPTURE_ATTEMPTED = False
 _GATEWAY_LAUNCH_ENV_STATE: tuple[dict[str, str], str] | None = None
 _GATEWAY_LAUNCH_ENV_ERROR: str | None = None
+_GATEWAY_START_VALIDATOR_MUTEX = threading.Lock()
+_GATEWAY_START_VALIDATOR_ATTEMPTED = False
+_GATEWAY_START_VALIDATOR_ERROR: str | None = None
+_GATEWAY_START_PROVENANCE: dict[str, str | int] | None = None
+_GLADLY_RUNTIME_INSTALL_RECEIPT = ".gladly-runtime-install.json"
+_GLADLY_RUNTIME_INSTALL_SCHEMA = "gladly.runtime_install.v3"
+_GLADLY_RUNTIME_MANIFEST_SCHEMA = "hermes.runtime_bundle_manifest.v1"
+_GLADLY_GATEWAY_VALIDATOR_IMPORT_CLOSURE = (
+    "runtime-gateway-enable-cli.ts",
+    "runtime-manifest-cli.ts",
+    "runtime-manifest.ts",
+    "codex-sandbox-executable.ts",
+    "runtime-cron-policy.ts",
+    "runtime-env-contract.ts",
+    "stable-file-evidence.ts",
+    "windows-known-paths.ts",
+    "runtime-install-evidence.ts",
+    "runtime-release-gate.ts",
+    "runtime-authority-state.ts",
+    "runtime-claim-authority.ts",
+)
+
+
+def _canonical_json(value: object) -> str:
+    """Match the Gladly runtime canonical-JSON digest contract."""
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _sha256_digest(value: bytes) -> str:
+    return f"sha256:{hashlib.sha256(value).hexdigest()}"
+
+
+def _normalized_evidence_path(value: str | os.PathLike) -> str:
+    resolved = Path(value).resolve(strict=True).as_posix()
+    return resolved.casefold() if sys.platform == "win32" else resolved
+
+
+def _same_evidence_path(
+    left: str | os.PathLike,
+    right: str | os.PathLike,
+) -> bool:
+    try:
+        return _normalized_evidence_path(left) == _normalized_evidence_path(right)
+    except OSError:
+        return False
+
+
+def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+        getattr(value, "st_file_attributes", 0),
+    )
+
+
+def _assert_closed_path(path: Path, label: str) -> Path:
+    """Reject every link/reparse component and return the lexical target."""
+    candidate = Path(os.path.abspath(os.fspath(path)))
+    anchor = Path(candidate.anchor)
+    current = anchor
+    for part in candidate.parts[1:]:
+        current = current / part
+        status = current.lstat()
+        if stat.S_ISLNK(status.st_mode) or bool(
+            getattr(status, "st_file_attributes", 0) & 0x400
+        ):
+            raise OSError(f"{label} traverses a link or reparse point")
+    if _normalized_launch_cwd(candidate) != _normalized_launch_cwd(
+        candidate.resolve(strict=True)
+    ):
+        raise OSError(f"{label} resolves through a redirected path")
+    return candidate
+
+
+def _stable_regular_file(path: Path, label: str) -> dict[str, object]:
+    """Read exact bytes through one no-follow handle with ancestor rechecks."""
+    candidate = _assert_closed_path(path, label)
+    before = candidate.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise OSError(f"{label} is not a regular file")
+    expected = _file_identity(before)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(candidate, flags)
+    try:
+        opened_before = os.fstat(descriptor)
+        if _file_identity(opened_before) != expected:
+            raise OSError(f"{label} changed before its handle opened")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        opened_after = os.fstat(descriptor)
+        if _file_identity(opened_after) != expected:
+            raise OSError(f"{label} changed while its handle was open")
+    finally:
+        os.close(descriptor)
+    content = b"".join(chunks)
+    after_path = candidate.lstat()
+    if _file_identity(after_path) != expected:
+        raise OSError(f"{label} path changed while it was read")
+    _assert_closed_path(candidate, label)
+    final = candidate.lstat()
+    if _file_identity(final) != expected:
+        raise OSError(f"{label} changed after its handle closed")
+    return {
+        "path": _normalized_evidence_path(candidate),
+        "content": content,
+        "fileDigest": _sha256_digest(content),
+        "identity": expected,
+    }
+
+
+def _strict_json_bytes(content: bytes, label: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(
+            content.decode("utf-8", errors="strict"),
+            object_pairs_hook=_json_object_without_duplicate_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"{label} is not strict JSON data") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{label} is not a JSON object")
+    return parsed
+
+
+def _managed_install_root() -> Path | None:
+    """Detect the Gladly embedding from the imported tree, never public env."""
+    lexical_module = Path(os.path.abspath(__file__))
+    candidates: list[Path] = []
+    source_agent_root = lexical_module.parent.parent
+    if source_agent_root.name.casefold() == "hermes-agent":
+        candidates.append(source_agent_root)
+    interpreter = Path(os.path.abspath(sys.executable))
+    if interpreter.parent.name.casefold() in {"scripts", "bin"}:
+        venv_root = interpreter.parent.parent
+        interpreter_agent_root = venv_root.parent
+        if (
+            venv_root.name.casefold() == "venv"
+            and interpreter_agent_root.name.casefold() == "hermes-agent"
+        ):
+            try:
+                module_key = _normalized_launch_cwd(lexical_module)
+                agent_key = _normalized_launch_cwd(interpreter_agent_root)
+                if os.path.commonpath([module_key, agent_key]) == agent_key:
+                    candidates.append(interpreter_agent_root)
+            except (OSError, ValueError):
+                pass
+    if not candidates:
+        return None
+    agent_root = candidates[0]
+    root = agent_root.parent
+    receipt = agent_root / "venv" / _GLADLY_RUNTIME_INSTALL_RECEIPT
+    validator = root / "bridge" / "src" / "runtime-gateway-start-validator-cli.ts"
+    home = root / "home"
+    # Receipt deletion or public HERMES_HOME redirection must not turn a
+    # managed checkout into a standalone one.  The embedding layout itself is
+    # the marker; missing evidence is handled as a fail-closed contract error.
+    if not (receipt.exists() or validator.exists() or home.is_dir()):
+        return None
+    _assert_closed_path(lexical_module, "Imported Hermes environment loader")
+    _assert_closed_path(root, "Managed Gladly checkout")
+    return root
+
+
+def _receipt_tool(
+    receipt: Mapping[str, object],
+    name: str,
+) -> tuple[str, str]:
+    tools = receipt.get("tools")
+    if not isinstance(tools, dict):
+        raise ValueError("managed receipt tools are missing")
+    tool = tools.get(name)
+    if not isinstance(tool, dict):
+        raise ValueError(f"managed receipt {name} tool is missing")
+    path = tool.get("path")
+    identity_digest = tool.get("identityDigest")
+    if (
+        not isinstance(path, str)
+        or not path
+        or not (os.path.isabs(path) or ntpath.isabs(path))
+        or not isinstance(identity_digest, str)
+        or _SHA256_DIGEST_RE.fullmatch(identity_digest) is None
+    ):
+        raise ValueError(f"managed receipt {name} tool is invalid")
+    return path, identity_digest
+
+
+def _executable_identity_digest(path: str, label: str) -> tuple[str, dict[str, object]]:
+    measured = _stable_regular_file(Path(path), label)
+    payload = {
+        "path": measured["path"],
+        "fileDigest": measured["fileDigest"],
+    }
+    return _sha256_digest(_canonical_json(payload).encode("utf-8")), measured
+
+
+def _managed_install_contract() -> dict[str, object] | None:
+    """Derive the only valid managed validator contract from fixed evidence."""
+    root = _managed_install_root()
+    if root is None:
+        return None
+    agent_root = root / "hermes-agent"
+    home = root / "home"
+    receipt_path = agent_root / "venv" / _GLADLY_RUNTIME_INSTALL_RECEIPT
+    receipt_file = _stable_regular_file(receipt_path, "Managed runtime install receipt")
+    receipt = _strict_json_bytes(
+        receipt_file["content"],  # type: ignore[arg-type]
+        "Managed runtime install receipt",
+    )
+    if receipt.get("schemaVersion") != _GLADLY_RUNTIME_INSTALL_SCHEMA:
+        raise ValueError("managed runtime install receipt schema is unsupported")
+    bun_path, bun_identity = _receipt_tool(receipt, "bun")
+    actual_bun_identity, bun_file = _executable_identity_digest(
+        bun_path,
+        "Managed receipt-bound Bun executable",
+    )
+    if actual_bun_identity != bun_identity:
+        raise ValueError("managed receipt-bound Bun executable identity changed")
+    runtime_path = receipt.get("runtimePathPolicy")
+    if not isinstance(runtime_path, dict):
+        raise ValueError("managed receipt PATH policy is missing")
+    path_value = runtime_path.get("value")
+    if not isinstance(path_value, str) or not path_value:
+        raise ValueError("managed receipt PATH policy is invalid")
+    validator_script = root / "bridge" / "src" / "runtime-gateway-start-validator-cli.ts"
+    validator_file = _stable_regular_file(
+        validator_script,
+        "Managed gateway start validator entrypoint",
+    )
+    manifest_path = home / "state" / "runtime-bundle-manifest.json"
+    validator_argv = (
+        str(validator_script),
+        "--root",
+        str(root),
+        "--manifest",
+        str(manifest_path),
+    )
+    managed_values = {
+        "HERMES_GATEWAY_RUNTIME_PATH": path_value,
+        "PATH": path_value,
+        "HERMES_GATEWAY_START_VALIDATOR": bun_path,
+        "HERMES_GATEWAY_START_VALIDATOR_ARGS": _encode_gateway_start_validator_args(
+            validator_argv
+        ),
+    }
+    _validate_gateway_managed_launch_values(managed_values)
+    return {
+        "root": root,
+        "agentRoot": agent_root,
+        "home": home,
+        "receiptPath": receipt_path,
+        "receipt": receipt,
+        "receiptFile": receipt_file,
+        "receiptDigest": _sha256_digest(_canonical_json(receipt).encode("utf-8")),
+        "bunPath": bun_path,
+        "bunIdentityDigest": bun_identity,
+        "bunFile": bun_file,
+        "validatorScript": validator_script,
+        "validatorFile": validator_file,
+        "manifestPath": manifest_path,
+        "validatorArgv": validator_argv,
+        "managedValues": managed_values,
+    }
+
+
+def _manifest_inventory_digest(manifest: Mapping[str, object], item_id: str) -> str:
+    tools = manifest.get("tools")
+    if not isinstance(tools, list):
+        raise ValueError("managed runtime manifest inventory is missing")
+    matches = [
+        item for item in tools
+        if isinstance(item, dict) and item.get("id") == item_id
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"managed runtime manifest must bind exactly one {item_id}")
+    digest = matches[0].get("digest")
+    if not isinstance(digest, str) or _SHA256_DIGEST_RE.fullmatch(digest) is None:
+        raise ValueError(f"managed runtime manifest {item_id} digest is invalid")
+    return digest
+
+
+def _managed_start_expectations(contract: Mapping[str, object]) -> dict[str, object]:
+    """Bind the executable/entrypoint/output to the current stored manifest."""
+    manifest_path = contract["manifestPath"]
+    if not isinstance(manifest_path, Path):
+        raise ValueError("managed runtime manifest path is invalid")
+    manifest_file = _stable_regular_file(manifest_path, "Managed stored runtime manifest")
+    manifest = _strict_json_bytes(
+        manifest_file["content"],  # type: ignore[arg-type]
+        "Managed stored runtime manifest",
+    )
+    if manifest.get("schemaVersion") != _GLADLY_RUNTIME_MANIFEST_SCHEMA:
+        raise ValueError("managed stored runtime manifest schema is unsupported")
+    receipt_digest = contract["receiptDigest"]
+    bun_identity = contract["bunIdentityDigest"]
+    validator_file = contract["validatorFile"]
+    if (
+        _manifest_inventory_digest(manifest, "runtime/install-receipt")
+        != receipt_digest
+        or _manifest_inventory_digest(manifest, "runtime/bun-executable")
+        != bun_identity
+        or not isinstance(validator_file, dict)
+        or _manifest_inventory_digest(manifest, "runtime/gateway-start-validator")
+        != validator_file.get("fileDigest")
+    ):
+        raise ValueError(
+            "managed validator executable or entrypoint is not receipt/manifest-bound"
+        )
+    root = contract.get("root")
+    if not isinstance(root, Path):
+        raise ValueError("managed runtime root is invalid")
+    closure_files: dict[str, dict[str, object]] = {}
+    for dependency in _GLADLY_GATEWAY_VALIDATOR_IMPORT_CLOSURE:
+        item_id = f"runtime/windows-gateway-disable-import/{dependency}"
+        measured = _stable_regular_file(
+            root / "bridge" / "src" / dependency,
+            f"Managed gateway validator import {dependency}",
+        )
+        if _manifest_inventory_digest(manifest, item_id) != measured["fileDigest"]:
+            raise ValueError(
+                f"managed gateway validator import {dependency} is not manifest-bound"
+            )
+        closure_files[dependency] = measured
+    current_loader = _stable_regular_file(
+        Path(__file__),
+        "Managed gateway environment loader",
+    )
+    if (
+        _manifest_inventory_digest(manifest, "runtime/windows-gateway-env-loader")
+        != current_loader["fileDigest"]
+    ):
+        raise ValueError("managed gateway environment loader is not manifest-bound")
+    manifest_digest = manifest.get("digest")
+    if not isinstance(manifest_digest, str) or _SHA256_DIGEST_RE.fullmatch(manifest_digest) is None:
+        raise ValueError("managed stored runtime manifest digest is invalid")
+    expected_provenance = {
+        "version": 1,
+        "receiptDigest": receipt_digest,
+        "manifestDigest": manifest_digest,
+        "taskEvidenceDigest": _manifest_inventory_digest(
+            manifest,
+            "runtime/windows-gateway-evidence",
+        ),
+    }
+    return {
+        "manifest": manifest,
+        "manifestFile": manifest_file,
+        "loaderFile": current_loader,
+        "closureFiles": closure_files,
+        "provenance": expected_provenance,
+    }
+
+
+def _measured_file_snapshot(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("managed measured-file evidence is invalid")
+    return {
+        "path": value.get("path"),
+        "fileDigest": value.get("fileDigest"),
+        "identity": value.get("identity"),
+    }
+
+
+def _managed_contract_snapshot(contract: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "root": str(contract.get("root")),
+        "agentRoot": str(contract.get("agentRoot")),
+        "home": str(contract.get("home")),
+        "receiptPath": str(contract.get("receiptPath")),
+        "receiptDigest": contract.get("receiptDigest"),
+        "bunPath": contract.get("bunPath"),
+        "bunIdentityDigest": contract.get("bunIdentityDigest"),
+        "validatorScript": str(contract.get("validatorScript")),
+        "manifestPath": str(contract.get("manifestPath")),
+        "validatorArgv": contract.get("validatorArgv"),
+        "managedValues": contract.get("managedValues"),
+        "receiptFile": _measured_file_snapshot(contract.get("receiptFile")),
+        "bunFile": _measured_file_snapshot(contract.get("bunFile")),
+        "validatorFile": _measured_file_snapshot(contract.get("validatorFile")),
+    }
+
+
+def _managed_expectations_snapshot(expected: Mapping[str, object]) -> dict[str, object]:
+    closure = expected.get("closureFiles")
+    if not isinstance(closure, dict):
+        raise ValueError("managed validator import-closure evidence is invalid")
+    return {
+        "provenance": expected.get("provenance"),
+        "manifestFile": _measured_file_snapshot(expected.get("manifestFile")),
+        "loaderFile": _measured_file_snapshot(expected.get("loaderFile")),
+        "closureFiles": {
+            name: _measured_file_snapshot(value)
+            for name, value in sorted(closure.items())
+        },
+    }
+
+
+def _encode_gateway_start_validator_args(args: list[str] | tuple[str, ...]) -> str:
+    """Encode the exact validator argv suffix as canonical unpadded base64url."""
+    _validate_gateway_start_validator_argv(args)
+    raw = json.dumps(
+        list(args), ensure_ascii=True, separators=(",", ":")
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _validate_gateway_start_validator_argv(
+    value: object,
+) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or not value or len(value) > 64:
+        raise ValueError("gateway start validator argv has an invalid shape")
+    result: list[str] = []
+    total = 0
+    for item in value:
+        if (
+            not isinstance(item, str)
+            or not item
+            or len(item) > 8192
+            or any(char in item for char in ("\x00", "\r", "\n"))
+        ):
+            raise ValueError("gateway start validator argv has an invalid item")
+        total += len(item)
+        result.append(item)
+    if total > 32768:
+        raise ValueError("gateway start validator argv is too large")
+    return tuple(result)
+
+
+def _decode_gateway_start_validator_args(raw: str) -> tuple[str, ...]:
+    """Decode only canonical unpadded base64url JSON arrays of argv strings."""
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or len(raw) > 65536
+        or re.fullmatch(r"[A-Za-z0-9_-]+", raw) is None
+    ):
+        raise ValueError("gateway start validator args are malformed")
+    try:
+        padding = "=" * (-len(raw) % 4)
+        decoded = base64.b64decode(
+            (raw + padding).encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+        if base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=") != raw:
+            raise ValueError("non-canonical base64url")
+        parsed = json.loads(decoded.decode("utf-8"))
+    except (
+        binascii.Error,
+        UnicodeDecodeError,
+        UnicodeEncodeError,
+        json.JSONDecodeError,
+        ValueError,
+    ) as exc:
+        raise ValueError("gateway start validator args are malformed") from exc
+    argv = _validate_gateway_start_validator_argv(parsed)
+    canonical = json.dumps(
+        list(argv), ensure_ascii=True, separators=(",", ":")
+    ).encode("utf-8")
+    if decoded != canonical:
+        raise ValueError("gateway start validator args are not canonical JSON")
+    return argv
+
+
+def _validate_gateway_managed_launch_values(
+    env: Mapping[str, str],
+) -> dict[str, str]:
+    """Validate and return the complete managed launch/provenance contract."""
+    values: dict[str, str] = {}
+    for key in _GATEWAY_MANAGED_LAUNCH_ENV_KEYS:
+        value = env.get(key)
+        if (
+            not isinstance(value, str)
+            or not value
+            or any(char in value for char in ("\x00", "\r", "\n"))
+        ):
+            raise ValueError(f"gateway managed launch environment is missing {key}")
+        values[key] = value
+
+    if values["PATH"] != values["HERMES_GATEWAY_RUNTIME_PATH"]:
+        raise ValueError("gateway PATH must match HERMES_GATEWAY_RUNTIME_PATH")
+    runtime_path = values["HERMES_GATEWAY_RUNTIME_PATH"]
+    if any(char in runtime_path for char in ('"', "%", "!")):
+        raise ValueError("gateway runtime PATH contains unsafe launcher syntax")
+    entries = runtime_path.split(";")
+    if any(not entry or entry != entry.strip() for entry in entries):
+        raise ValueError("gateway runtime PATH contains an empty or padded entry")
+    normalized: set[str] = set()
+    for entry in entries:
+        if not ntpath.isabs(entry):
+            raise ValueError("gateway runtime PATH contains a non-absolute entry")
+        if any(part in {".", ".."} for part in entry.replace("/", "\\").split("\\")):
+            raise ValueError("gateway runtime PATH contains a relative segment")
+        key = ntpath.normcase(ntpath.normpath(entry))
+        if key in normalized:
+            raise ValueError("gateway runtime PATH contains a duplicate entry")
+        normalized.add(key)
+    validator = values["HERMES_GATEWAY_START_VALIDATOR"]
+    if not (os.path.isabs(validator) or ntpath.isabs(validator)):
+        raise ValueError("gateway start validator must be an absolute path")
+    _decode_gateway_start_validator_args(
+        values["HERMES_GATEWAY_START_VALIDATOR_ARGS"]
+    )
+    return values
 
 
 def _encode_gateway_launch_env_lock(
@@ -95,6 +629,10 @@ def _encode_gateway_launch_env_lock(
             raise ValueError(f"gateway launch environment is missing a valid {key}")
         protected[key] = value
 
+    managed_values = [env.get(key) for key in _GATEWAY_MANAGED_LAUNCH_ENV_KEYS]
+    if any(value is not None for value in managed_values):
+        protected.update(_validate_gateway_managed_launch_values(env))
+
     cwd_value = os.fspath(cwd)
     if not cwd_value or "\x00" in cwd_value:
         raise ValueError("gateway launch environment is missing a valid cwd")
@@ -108,7 +646,7 @@ def _encode_gateway_launch_env_lock(
         raise ValueError("gateway cwd must match its locked reviewed code root")
 
     payload = {
-        "version": 1,
+        "version": 3 if "PATH" in protected else 1,
         "cwd": cwd_value,
         "env": protected,
     }
@@ -143,19 +681,29 @@ def _decode_gateway_launch_env_lock(raw: str) -> tuple[dict[str, str], str]:
 
     if not isinstance(payload, dict) or set(payload) != {"version", "cwd", "env"}:
         raise ValueError("gateway launch environment lock has an invalid shape")
-    if payload.get("version") != 1:
+    version = payload.get("version")
+    if version not in {1, 3}:
         raise ValueError("gateway launch environment lock has an unsupported version")
 
     cwd = payload.get("cwd")
     values = payload.get("env")
     if not isinstance(cwd, str) or not cwd or "\x00" in cwd:
         raise ValueError("gateway launch environment lock has an invalid cwd")
-    if not isinstance(values, dict) or set(values) != set(_GATEWAY_LAUNCH_ENV_KEYS):
+    expected_keys = set(_GATEWAY_LAUNCH_ENV_KEYS)
+    if version == 3:
+        expected_keys.update(_GATEWAY_MANAGED_LAUNCH_ENV_KEYS)
+    if not isinstance(values, dict) or set(values) != expected_keys:
         raise ValueError("gateway launch environment lock has incomplete variables")
-    for key in _GATEWAY_LAUNCH_ENV_KEYS:
+    for key in expected_keys:
         value = values.get(key)
-        if not isinstance(value, str) or not value or "\x00" in value:
+        if (
+            not isinstance(value, str)
+            or not value
+            or any(char in value for char in ("\x00", "\r", "\n"))
+        ):
             raise ValueError(f"gateway launch environment lock has an invalid {key}")
+    if version == 3:
+        _validate_gateway_managed_launch_values(values)
     if _normalized_launch_cwd(values["HERMES_HOME"]) != _normalized_launch_cwd(
         values["HERMES_RUNTIME_HOME"]
     ):
@@ -239,6 +787,328 @@ def _gateway_launch_env_locked_values() -> dict[str, str] | None:
             return None
         values, _expected_cwd = _GATEWAY_LAUNCH_ENV_STATE
         return dict(values)
+
+
+def _json_object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _decode_gateway_start_provenance(raw: str) -> dict[str, str | int]:
+    """Decode the validator's exact, duplicate-free provenance response."""
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > 16384:
+        raise ValueError("gateway start provenance has invalid output")
+    parsed = json.loads(
+        raw,
+        object_pairs_hook=_json_object_without_duplicate_keys,
+    )
+    expected_keys = {
+        "version",
+        "receiptDigest",
+        "manifestDigest",
+        "taskEvidenceDigest",
+    }
+    if (
+        not isinstance(parsed, dict)
+        or set(parsed) != expected_keys
+        or type(parsed.get("version")) is not int
+        or parsed.get("version") != 1
+        or any(
+            not isinstance(parsed.get(key), str)
+            or _SHA256_DIGEST_RE.fullmatch(parsed[key]) is None
+            for key in (
+                "receiptDigest",
+                "manifestDigest",
+                "taskEvidenceDigest",
+            )
+        )
+    ):
+        raise ValueError("gateway start provenance has an invalid shape")
+    return {
+        "version": 1,
+        "receiptDigest": parsed["receiptDigest"],
+        "manifestDigest": parsed["manifestDigest"],
+        "taskEvidenceDigest": parsed["taskEvidenceDigest"],
+    }
+
+
+def _gateway_start_provenance() -> dict[str, str | int] | None:
+    """Return the immutable, validator-confirmed launch provenance."""
+    with _GATEWAY_LAUNCH_ENV_CAPTURE_MUTEX:
+        if _GATEWAY_START_PROVENANCE is None:
+            return None
+        return dict(_GATEWAY_START_PROVENANCE)
+
+
+def _assert_managed_launch_matches_install(
+    values: Mapping[str, str],
+    expected_cwd: str,
+    contract: Mapping[str, object],
+) -> None:
+    root = contract.get("root")
+    home = contract.get("home")
+    agent_root = contract.get("agentRoot")
+    managed_values = contract.get("managedValues")
+    validator_argv = contract.get("validatorArgv")
+    if (
+        not isinstance(root, Path)
+        or not isinstance(home, Path)
+        or not isinstance(agent_root, Path)
+        or not isinstance(managed_values, dict)
+        or not isinstance(validator_argv, tuple)
+    ):
+        raise ValueError("managed install contract is incomplete")
+    for name, expected in (
+        ("HERMES_HOME", home),
+        ("HERMES_RUNTIME_HOME", home),
+        ("GLADLY_HERMES_CODE_ROOT", root),
+        ("VIRTUAL_ENV", agent_root / "venv"),
+    ):
+        actual = values.get(name)
+        if not isinstance(actual, str) or not _same_evidence_path(actual, expected):
+            raise ValueError(f"managed launch {name} redirects outside the reviewed install")
+    if not _same_evidence_path(expected_cwd, root):
+        raise ValueError("managed launch cwd redirects outside the reviewed install")
+    pythonpath = values.get("PYTHONPATH", "").split(os.pathsep)
+    if len(pythonpath) != 1 or not _same_evidence_path(pythonpath[0], agent_root):
+        raise ValueError("managed launch PYTHONPATH is not the exact imported agent root")
+    for key in ("HERMES_GATEWAY_RUNTIME_PATH", "PATH"):
+        if values.get(key) != managed_values.get(key):
+            raise ValueError(f"managed launch {key} differs from the receipt PATH policy")
+    if not _same_evidence_path(
+        values.get("HERMES_GATEWAY_START_VALIDATOR", ""),
+        str(managed_values.get("HERMES_GATEWAY_START_VALIDATOR", "")),
+    ):
+        raise ValueError("managed launch validator is not the receipt-bound Bun executable")
+    actual_argv = _decode_gateway_start_validator_args(
+        values.get("HERMES_GATEWAY_START_VALIDATOR_ARGS", "")
+    )
+    if len(actual_argv) != len(validator_argv):
+        raise ValueError("managed launch validator argv has the wrong shape")
+    for index, (actual, expected) in enumerate(zip(actual_argv, validator_argv)):
+        if index in {0, 2, 4}:
+            if not _same_evidence_path(actual, expected):
+                raise ValueError("managed launch validator argv redirects this runtime")
+        elif actual != expected:
+            raise ValueError("managed launch validator argv changes a fixed option")
+
+
+def _assert_gateway_start_provenance_if_managed() -> None:
+    """Reject a managed gateway runtime that did not enter via its v3 lock.
+
+    Parent install/inspection commands need the public managed variables in
+    order to render and compare launch evidence, so this assertion belongs at
+    the gateway runtime entrypoints rather than at module import. It closes the
+    raw ``gateway run`` path without breaking disabled staging operations.
+    """
+    opt_in_keys = (
+        "HERMES_GATEWAY_RUNTIME_PATH",
+        *_GATEWAY_MANAGED_PROVENANCE_ENV_KEYS,
+    )
+    managed_requested = any(key in os.environ for key in opt_in_keys)
+    managed_layout = _managed_install_root() is not None
+    with _GATEWAY_LAUNCH_ENV_CAPTURE_MUTEX:
+        state = _GATEWAY_LAUNCH_ENV_STATE
+        state_is_managed = bool(
+            state is not None and "HERMES_GATEWAY_RUNTIME_PATH" in state[0]
+        )
+        provenance = _GATEWAY_START_PROVENANCE
+        error = _GATEWAY_START_VALIDATOR_ERROR
+    if not managed_requested and not state_is_managed and not managed_layout:
+        return
+    if error:
+        raise RuntimeError(error)
+    if not state_is_managed or provenance is None:
+        raise RuntimeError(
+            "Refusing managed gateway runtime without validator-confirmed "
+            "launch provenance. Start the reviewed Scheduled Task with "
+            "`hermes gateway start`."
+        )
+    if managed_layout:
+        # The first validation occurs before external secret providers.  Run
+        # the exact receipt/manifest-bound validator again here so task state,
+        # runtime authority, hold and canary freshness are checked at the last
+        # boundary immediately before the serving/ticker path.
+        _run_gateway_start_validator_fresh()
+
+
+def _validator_file_identity(path: str) -> tuple[int, int, int, int, int, int, int]:
+    """Capture a no-follow identity for the exact managed validator executable."""
+    candidate = Path(path)
+    before = candidate.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise OSError("validator is not a regular file")
+    if bool(getattr(before, "st_file_attributes", 0) & 0x400):
+        raise OSError("validator is a reparse point")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(candidate, flags)
+    try:
+        opened = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after = candidate.lstat()
+
+    def identity(
+        value: os.stat_result,
+    ) -> tuple[int, int, int, int, int, int, int]:
+        return (
+            value.st_dev,
+            value.st_ino,
+            stat.S_IFMT(value.st_mode),
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+            getattr(value, "st_file_attributes", 0),
+        )
+
+    identities = {identity(before), identity(opened), identity(after)}
+    if len(identities) != 1:
+        raise OSError("validator changed during identity capture")
+    return identity(after)
+
+
+def _run_gateway_start_validator_if_needed() -> None:
+    """Serialize the process-once validator so no concurrent loader bypasses it."""
+    with _GATEWAY_START_VALIDATOR_MUTEX:
+        _run_gateway_start_validator_once_if_needed()
+
+
+def _execute_gateway_start_validator(
+    values: Mapping[str, str],
+    expected_cwd: str,
+    contract: Mapping[str, object] | None,
+) -> dict[str, str | int]:
+    managed = _validate_gateway_managed_launch_values(values)
+    if contract is not None:
+        _assert_managed_launch_matches_install(values, expected_cwd, contract)
+        expected = _managed_start_expectations(contract)
+    else:
+        expected = None
+    validator = managed["HERMES_GATEWAY_START_VALIDATOR"]
+    argv_suffix = _decode_gateway_start_validator_args(
+        managed["HERMES_GATEWAY_START_VALIDATOR_ARGS"]
+    )
+    from hermes_cli.gateway_windows import _managed_gateway_child_environment
+
+    child_env = _managed_gateway_child_environment(values)
+    before_identity = _validator_file_identity(validator)
+    run_kwargs: dict[str, object] = {
+        "cwd": expected_cwd,
+        "env": child_env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "strict",
+        "timeout": 60,
+        "check": False,
+        "close_fds": True,
+    }
+    if sys.platform == "win32":
+        run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    completed = subprocess.run([validator, *argv_suffix], **run_kwargs)
+    after_identity = _validator_file_identity(validator)
+    if before_identity != after_identity:
+        raise RuntimeError("validator executable changed while it ran")
+    if completed.returncode != 0:
+        raise RuntimeError("validator returned a non-zero status")
+    parsed = _decode_gateway_start_provenance(completed.stdout)
+    if expected is not None:
+        final_contract = _managed_install_contract()
+        if final_contract is None:
+            raise RuntimeError("managed install disappeared during validation")
+        final_expected = _managed_start_expectations(final_contract)
+        if (
+            _managed_contract_snapshot(contract)
+            != _managed_contract_snapshot(final_contract)
+            or _managed_expectations_snapshot(expected)
+            != _managed_expectations_snapshot(final_expected)
+            or parsed != expected["provenance"]
+        ):
+            raise RuntimeError(
+                "validator evidence changed or its output does not match trusted provenance"
+            )
+    return parsed
+
+
+def _run_gateway_start_validator_fresh() -> None:
+    """Revalidate current managed evidence at the final serving boundary."""
+    global _GATEWAY_START_VALIDATOR_ERROR
+    global _GATEWAY_START_PROVENANCE
+
+    with _GATEWAY_LAUNCH_ENV_CAPTURE_MUTEX:
+        state = _GATEWAY_LAUNCH_ENV_STATE
+    if state is None or "HERMES_GATEWAY_RUNTIME_PATH" not in state[0]:
+        raise RuntimeError(
+            "Refusing managed gateway runtime without a v3 launch environment lock."
+        )
+    values, expected_cwd = state
+    try:
+        parsed = _execute_gateway_start_validator(
+            values,
+            expected_cwd,
+            _managed_install_contract(),
+        )
+    except Exception as exc:
+        message = (
+            "Refusing managed gateway startup because final runtime evidence "
+            "could not be validated. Re-run the Gladly runtime preparation flow."
+        )
+        with _GATEWAY_LAUNCH_ENV_CAPTURE_MUTEX:
+            _GATEWAY_START_VALIDATOR_ERROR = message
+        raise RuntimeError(message) from exc
+    with _GATEWAY_LAUNCH_ENV_CAPTURE_MUTEX:
+        _GATEWAY_START_PROVENANCE = dict(parsed)
+
+
+def _run_gateway_start_validator_once_if_needed() -> None:
+    """Run the exact managed start validator once, before any network source.
+
+    The private v3 launch lock binds the validator executable and canonical
+    argv. The validator derives the current receipt, complete stored manifest,
+    and Scheduled Task evidence digests at each start, receives only the
+    reviewed Windows child allowlist, and returns those identities in one
+    strict JSON provenance object. Generic/v1 launchers remain unchanged.
+    """
+    global _GATEWAY_START_VALIDATOR_ATTEMPTED
+    global _GATEWAY_START_VALIDATOR_ERROR
+    global _GATEWAY_START_PROVENANCE
+
+    with _GATEWAY_LAUNCH_ENV_CAPTURE_MUTEX:
+        if _GATEWAY_START_VALIDATOR_ATTEMPTED:
+            if _GATEWAY_START_VALIDATOR_ERROR:
+                raise RuntimeError(_GATEWAY_START_VALIDATOR_ERROR)
+            return
+        state = _GATEWAY_LAUNCH_ENV_STATE
+        if state is None or "HERMES_GATEWAY_RUNTIME_PATH" not in state[0]:
+            return
+        _GATEWAY_START_VALIDATOR_ATTEMPTED = True
+        values, expected_cwd = state
+        _validate_gateway_managed_launch_values(values)
+
+    try:
+        parsed = _execute_gateway_start_validator(
+            values,
+            expected_cwd,
+            _managed_install_contract(),
+        )
+    except Exception as exc:
+        message = (
+            "Refusing managed gateway startup because runtime evidence could "
+            "not be validated. Re-run the Gladly runtime preparation flow."
+        )
+        with _GATEWAY_LAUNCH_ENV_CAPTURE_MUTEX:
+            _GATEWAY_START_VALIDATOR_ERROR = message
+        raise RuntimeError(message) from exc
+
+    with _GATEWAY_LAUNCH_ENV_CAPTURE_MUTEX:
+        _GATEWAY_START_PROVENANCE = dict(parsed)
 
 
 def _known_hermes_env_keys() -> set[str]:
@@ -764,6 +1634,13 @@ def load_hermes_dotenv(
         finally:
             _reapply_gateway_launch_env_lock()
         loaded.append(project_env_path)
+
+    # A managed gateway must prove its exact receipt + complete manifest +
+    # Scheduled Task evidence after all local dotenv inputs have been applied,
+    # but before external secret providers (which may perform network I/O) or
+    # any gateway ticker can start. The validator is process-once; later
+    # per-turn dotenv reloads only re-apply the already-proven launch lock.
+    _run_gateway_start_validator_if_needed()
 
     # External secret sources are skipped in two updater situations:
     # 1. ``load_external_secrets=False`` — the caller is an ``update``
