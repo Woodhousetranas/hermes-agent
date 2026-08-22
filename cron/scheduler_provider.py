@@ -180,7 +180,13 @@ class CronScheduler(ABC):
         ``fire_claimed`` in tracked background work.
         """
         from cron.executions import create_execution, finish_execution
-        from cron.jobs import claim_job_for_fire
+        from cron.jobs import claim_job_for_fire, is_cron_dispatch_paused
+
+        # Do not create even a failed execution-ledger attempt while the host
+        # is quarantined.  ``force`` is intentionally unable to bypass this
+        # process-wide safety gate.
+        if is_cron_dispatch_paused():
+            return None
 
         execution = create_execution(job_id, source=self.name)
         claim_kwargs = {"return_job": True}
@@ -220,7 +226,16 @@ class CronScheduler(ABC):
         — e.g. the dashboard lifespan drain signalling pending webhook
         fires before the event loop shuts down.
         """
-        from cron.scheduler import run_one_job
+        from cron.jobs import is_cron_dispatch_paused
+        from cron.scheduler import cancel_claimed_fire_for_pause, run_one_job
+
+        # The pause can engage after ``claim_fire`` admitted this attempt but
+        # before the transport-owned worker reaches execution.  Close the
+        # ledger row and release/restore the exact owned claim instead of
+        # consuming the occurrence or invoking any job side effect.
+        if is_cron_dispatch_paused():
+            cancel_claimed_fire_for_pause(claimed_job)
+            return True
 
         run_one_job(
             claimed_job,
@@ -374,13 +389,25 @@ def fire_overdue_jobs(
     if grace_minutes <= 0:
         return 0
 
-    from cron.jobs import _ensure_aware, _hermes_now, is_job_runnable, load_jobs
+    from cron.jobs import (
+        _ensure_aware,
+        _hermes_now,
+        is_cron_dispatch_paused,
+        is_job_runnable,
+        load_jobs,
+    )
+    from cron.scheduler import cancel_claimed_fire_for_pause
+
+    if is_cron_dispatch_paused():
+        return 0
 
     if now is None:
         now = _hermes_now()
 
     fired = 0
     for job in load_jobs():
+        if is_cron_dispatch_paused():
+            break
         if not is_job_runnable(job):
             continue
         next_run_at = job.get("next_run_at")
@@ -407,13 +434,30 @@ def fire_overdue_jobs(
             # CAS — losing means an external retry beat us, which is
             # fine), then run the job off-thread so the caller's loop is
             # never blocked for the length of an agent run.
+            if is_cron_dispatch_paused():
+                break
             claimed = provider.claim_fire(job_id)
             if claimed is None:
                 continue
+            if is_cron_dispatch_paused():
+                cancel_claimed_fire_for_pause(claimed)
+                continue
+
+            def _fire_claimed_if_not_paused(
+                claimed_job=claimed,
+                fire_provider=provider,
+            ):
+                if is_cron_dispatch_paused():
+                    cancel_claimed_fire_for_pause(claimed_job)
+                    return False
+                return fire_provider.fire_claimed(
+                    claimed_job,
+                    adapters=adapters,
+                    loop=loop,
+                )
+
             threading.Thread(
-                target=provider.fire_claimed,
-                args=(claimed,),
-                kwargs={"adapters": adapters, "loop": loop},
+                target=_fire_claimed_if_not_paused,
                 daemon=True,
                 name=f"cron-misfire-{job_id[:12]}",
             ).start()

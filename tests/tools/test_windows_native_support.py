@@ -928,6 +928,7 @@ class TestWindowlessGatewayRestartSpec:
     hidden-console respawn spec (normalized interpreter + stable cwd + env
     overlay)."""
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="non-Windows contract")
     def test_noop_on_non_windows(self):
         import hermes_cli.gateway_windows as gw
 
@@ -940,13 +941,17 @@ class TestWindowlessGatewayRestartSpec:
     def test_empty_argv_is_safe(self):
         import hermes_cli.gateway_windows as gw
 
+        if sys.platform == "win32":
+            with pytest.raises(RuntimeError, match="non-empty argv"):
+                gw.windowless_gateway_restart_spec([])
+            return
         new_argv, cwd, env = gw.windowless_gateway_restart_spec([])
         assert new_argv == []
         assert cwd == ""
         assert env == {}
 
     @pytest.mark.windows_only
-    def test_windows_keeps_console_python_and_preserves_tail(self):
+    def test_windows_keeps_console_python_and_preserves_tail(self, tmp_path):
         """On Windows the console interpreter is kept (hidden-console launch,
         NOT a pythonw swap — #54220/#56747) while every subsequent argument
         is preserved verbatim.
@@ -961,8 +966,15 @@ class TestWindowlessGatewayRestartSpec:
         """
         import hermes_cli.gateway_windows as gw
 
+        python_exe = tmp_path / "venv" / "Scripts" / "python.exe"
+        hermes_home = tmp_path / "hermes-home"
+        code_root = tmp_path / "reviewed-root"
+        python_exe.parent.mkdir(parents=True)
+        python_exe.write_text("", encoding="utf-8")
+        (hermes_home / "profiles" / "work").mkdir(parents=True)
+        code_root.mkdir()
         argv = [
-            "C:/venv/Scripts/python.exe",
+            str(python_exe),
             "-m",
             "hermes_cli.main",
             "--profile",
@@ -975,20 +987,23 @@ class TestWindowlessGatewayRestartSpec:
         # Only the environment-dependent lookups are stubbed — the host is
         # genuinely Windows here.
         with mock.patch.object(
-            gw, "_stable_gateway_working_dir", return_value="C:/hermes"
+            gw, "_resolve_gateway_code_root", return_value=str(code_root)
         ), mock.patch(
-            "hermes_cli.config.get_hermes_home", return_value="C:/hermes"
+            "hermes_cli.config.get_hermes_home", return_value=str(hermes_home)
         ):
             new_argv, cwd, env = gw.windowless_gateway_restart_spec(list(argv))
 
         # Interpreter is kept as the console python — hidden-console launch,
         # no pythonw swap.
-        assert new_argv[0] == "C:/venv/Scripts/python.exe"
+        assert new_argv[0] == str(python_exe)
         # Everything after the interpreter is byte-for-byte preserved.
         assert new_argv[1:] == argv[1:]
-        assert cwd == "C:/hermes"
-        assert env["VIRTUAL_ENV"] == str(Path("C:/venv"))
+        assert cwd == str(code_root)
+        assert env["VIRTUAL_ENV"] == str(tmp_path / "venv")
         assert "PYTHONPATH" in env
+        assert env["HERMES_HOME"] == str(
+            (hermes_home / "profiles" / "work").resolve()
+        )
 
 
 # ---------------------------------------------------------------------------

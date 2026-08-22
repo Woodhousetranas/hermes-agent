@@ -9,6 +9,15 @@ import pytest
 from fastapi import HTTPException
 
 
+@pytest.fixture(autouse=True)
+def reset_cron_pause_latch():
+    import cron.jobs as jobs
+
+    jobs._reset_cron_dispatch_pause_latch_for_tests()
+    yield
+    jobs._reset_cron_dispatch_pause_latch_for_tests()
+
+
 @pytest.fixture()
 def isolated_profiles(tmp_path, monkeypatch):
     """Give profile discovery an isolated default home with one named profile."""
@@ -80,6 +89,29 @@ def test_fire_cron_job_scopes_store_and_runtime_home_together(
         assert scheduler._get_hermes_home() == default_home
     finally:
         reset_hermes_home_override(outer_token)
+
+
+def test_fire_cron_job_refuses_provider_override_while_paused(
+    isolated_profiles,
+    monkeypatch,
+):
+    from hermes_cli import web_server
+
+    class UnsafeOverrideProvider:
+        def fire_due(self, job_id, *, adapters=None, loop=None):
+            pytest.fail("paused dashboard fire reached provider override")
+
+    monkeypatch.setenv("HERMES_CRON_PAUSED", "true")
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler",
+        lambda: UnsafeOverrideProvider(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        web_server._fire_cron_job_for_profile("worker_alpha", "worker-job")
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "Cron dispatch is paused for runtime migration"
 
 
 def test_create_registers_scheduler_inside_target_profile(

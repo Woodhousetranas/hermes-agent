@@ -29571,11 +29571,14 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
         # against a late external retry arriving concurrently.
         if cron_provider is not None and tick_count % MISFIRE_SWEEP_EVERY == 0:
             try:
+                from cron.jobs import is_cron_dispatch_paused
                 from cron.scheduler_provider import fire_overdue_jobs
 
-                caught_up = fire_overdue_jobs(
-                    cron_provider, adapters=adapters, loop=loop
-                )
+                caught_up = 0
+                if not is_cron_dispatch_paused():
+                    caught_up = fire_overdue_jobs(
+                        cron_provider, adapters=adapters, loop=loop
+                    )
                 if caught_up:
                     logger.info(
                         "Misfire catch-up: fired %d overdue job(s)", caught_up
@@ -29673,6 +29676,17 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     """
     from cron.scheduler_provider import InProcessCronScheduler
     InProcessCronScheduler().start(stop_event, adapters=adapters, loop=loop, interval=interval)
+
+
+def _gateway_cron_can_dispatch(runner) -> bool:
+    """Combine the process-wide cron quarantine with gateway drain state."""
+    from cron.jobs import is_cron_dispatch_paused
+
+    return (
+        not is_cron_dispatch_paused()
+        and not runner._draining
+        and not runner._external_drain_active
+    )
 
 
 def _stop_cron_provider(provider) -> None:
@@ -30313,9 +30327,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # in-process ticker polls local due jobs, so only it receives the local
     # external-drain dispatch gate.
     if isinstance(cron_provider, InProcessCronScheduler):
-        cron_start_kwargs["can_dispatch"] = lambda: not (
-            runner._draining or runner._external_drain_active
-        )
+        cron_start_kwargs["can_dispatch"] = lambda: _gateway_cron_can_dispatch(runner)
     cron_thread = threading.Thread(
         target=cron_provider.start,
         args=(cron_stop,),

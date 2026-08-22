@@ -248,12 +248,28 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
 
 def cron_status():
     """Show cron execution status."""
-    from cron.jobs import list_jobs
+    from cron.jobs import is_cron_dispatch_paused, list_jobs
     from hermes_cli.gateway import find_gateway_pids
 
     print()
 
     provider = _active_cron_provider_name()
+    if is_cron_dispatch_paused():
+        print(color(
+            "⏸ Cron dispatch is PAUSED by HERMES_CRON_PAUSED — due jobs "
+            "remain queued and manual force cannot run them.",
+            Colors.YELLOW,
+        ))
+        print(color(
+            f"  Provider: {provider}. Gateway messaging can remain online; "
+            "restart every dispatch-capable Hermes process after changing the flag.",
+            Colors.DIM,
+        ))
+        print()
+        _print_active_jobs_summary(list_jobs(include_disabled=False))
+        print()
+        return
+
     if provider != "builtin":
         # An external provider (e.g. Chronos) does NOT run the in-process 60s
         # ticker — it arms one external one-shot per job and is fired by a

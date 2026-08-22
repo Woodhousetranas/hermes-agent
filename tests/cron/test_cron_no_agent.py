@@ -270,6 +270,107 @@ def test_run_job_script_bash_extension_also_runs_via_bash(hermes_env):
     assert output == "via bash"
 
 
+def _recording_cron_process(calls):
+    class _Process:
+        returncode = 0
+
+        def __init__(self, argv, **kwargs):
+            calls.append((argv, kwargs))
+
+        def communicate(self, timeout=None):
+            return "pinned bash", ""
+
+    return _Process
+
+
+def test_run_job_script_uses_explicit_hermes_bash_exe(
+    hermes_env, monkeypatch, tmp_path
+):
+    import cron.scheduler as scheduler
+
+    script = hermes_env / "scripts" / "pinned.sh"
+    script.write_text('printf "pinned bash\\n"\n', encoding="utf-8")
+    pinned_bash = tmp_path / "reviewed-toolchain" / "bash.exe"
+    pinned_bash.parent.mkdir()
+    pinned_bash.write_text("placeholder", encoding="utf-8")
+    monkeypatch.setenv("HERMES_BASH_EXE", str(pinned_bash))
+    monkeypatch.setattr(
+        scheduler.shutil,
+        "which",
+        lambda _name: pytest.fail("explicit Bash pin fell back to PATH"),
+    )
+    calls = []
+    monkeypatch.setattr(
+        scheduler.subprocess, "Popen", _recording_cron_process(calls)
+    )
+
+    ok, output = scheduler._run_job_script("pinned.sh")
+
+    assert ok is True
+    assert output == "pinned bash"
+    assert calls[0][0][0] == str(pinned_bash.resolve())
+    assert calls[0][0][1] == str(script.resolve())
+
+
+@pytest.mark.parametrize("configured", ["", "missing/bash.exe"])
+def test_run_job_script_invalid_explicit_bash_fails_without_path_fallback(
+    hermes_env, monkeypatch, configured
+):
+    import cron.scheduler as scheduler
+
+    (hermes_env / "scripts" / "pinned.sh").write_text(
+        "echo should-not-run\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_BASH_EXE", configured)
+    monkeypatch.setattr(
+        scheduler.shutil,
+        "which",
+        lambda _name: pytest.fail("invalid explicit Bash pin fell back to PATH"),
+    )
+    monkeypatch.setattr(
+        scheduler.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("invalid explicit Bash pin executed"),
+    )
+
+    ok, output = scheduler._run_job_script("pinned.sh")
+
+    assert ok is False
+    assert "HERMES_BASH_EXE" in output
+    assert "PATH fallback is disabled" in output
+
+
+def test_run_job_script_unset_bash_pin_preserves_path_discovery(
+    hermes_env, monkeypatch, tmp_path
+):
+    import cron.scheduler as scheduler
+
+    script = hermes_env / "scripts" / "discovered.sh"
+    script.write_text("echo discovered\n", encoding="utf-8")
+    discovered_bash = tmp_path / "path-toolchain" / "bash.exe"
+    discovered_bash.parent.mkdir()
+    discovered_bash.write_text("placeholder", encoding="utf-8")
+    monkeypatch.delenv("HERMES_BASH_EXE", raising=False)
+    discoveries = []
+
+    def discover(name):
+        discoveries.append(name)
+        return str(discovered_bash)
+
+    monkeypatch.setattr(scheduler.shutil, "which", discover)
+    calls = []
+    monkeypatch.setattr(
+        scheduler.subprocess, "Popen", _recording_cron_process(calls)
+    )
+
+    ok, output = scheduler._run_job_script("discovered.sh")
+
+    assert ok is True
+    assert output == "pinned bash"
+    assert discoveries == ["bash"]
+    assert calls[0][0][0] == str(discovered_bash)
+
+
 def test_run_job_shell_script_allows_msys_path_conversion_on_windows(hermes_env, monkeypatch):
     if sys.platform != "win32":
         pytest.skip("MSYS path conversion is a Windows/Git Bash concern")

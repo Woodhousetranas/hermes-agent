@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import codecs
 import io
+import json
 import os
 import sys
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from utils import atomic_replace, fast_safe_load
 
 
@@ -50,6 +54,191 @@ _SECRET_SOURCE_VALUES_BY_HOME: dict[str, dict[str, str]] = {}
 # config re-parse, and the ASCII sanitization sweep still ran every time.
 _APPLIED_HOMES: set[str] = set()
 _SECRET_SOURCE_CACHE_LOCK = threading.RLock()
+
+# Detached gateway launchers can pin their runtime provenance before Python
+# starts.  The private marker carries a versioned snapshot because
+# ``hermes_cli.main`` applies profile selection before its first dotenv load;
+# reading the public variables only at dotenv time would therefore be too late.
+# The snapshot is captured exactly once, removed from ``os.environ`` so child
+# processes cannot inherit it, and re-applied after every source that may use
+# ``override=True``.  Normal interactive/foreground invocations never set the
+# marker and retain the usual dotenv semantics.
+_GATEWAY_LAUNCH_ENV_LOCK_VAR = "_HERMES_GATEWAY_LAUNCH_ENV_LOCK"
+_GATEWAY_LAUNCH_ENV_KEYS: tuple[str, ...] = (
+    "HERMES_HOME",
+    "HERMES_RUNTIME_HOME",
+    "GLADLY_HERMES_CODE_ROOT",
+    "PYTHONPATH",
+    "VIRTUAL_ENV",
+)
+_GATEWAY_LAUNCH_ENV_CAPTURE_MUTEX = threading.Lock()
+_GATEWAY_LAUNCH_ENV_CAPTURE_ATTEMPTED = False
+_GATEWAY_LAUNCH_ENV_STATE: tuple[dict[str, str], str] | None = None
+_GATEWAY_LAUNCH_ENV_ERROR: str | None = None
+
+
+def _encode_gateway_launch_env_lock(
+    env: Mapping[str, str],
+    cwd: str | os.PathLike,
+) -> str:
+    """Encode the immutable environment snapshot used by gateway launchers.
+
+    This is deliberately a private launcher contract, not a user-facing config
+    option.  A launcher must provide every protected value; accepting a partial
+    snapshot would make a staged service appear pinned while leaving one path
+    open to a later ``.env`` override.
+    """
+    protected: dict[str, str] = {}
+    for key in _GATEWAY_LAUNCH_ENV_KEYS:
+        value = env.get(key)
+        if not isinstance(value, str) or not value or "\x00" in value:
+            raise ValueError(f"gateway launch environment is missing a valid {key}")
+        protected[key] = value
+
+    cwd_value = os.fspath(cwd)
+    if not cwd_value or "\x00" in cwd_value:
+        raise ValueError("gateway launch environment is missing a valid cwd")
+    if _normalized_launch_cwd(protected["HERMES_HOME"]) != _normalized_launch_cwd(
+        protected["HERMES_RUNTIME_HOME"]
+    ):
+        raise ValueError("gateway runtime home must match its locked Hermes home")
+    if _normalized_launch_cwd(cwd_value) != _normalized_launch_cwd(
+        protected["GLADLY_HERMES_CODE_ROOT"]
+    ):
+        raise ValueError("gateway cwd must match its locked reviewed code root")
+
+    payload = {
+        "version": 1,
+        "cwd": cwd_value,
+        "env": protected,
+    }
+    raw = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_gateway_launch_env_lock(raw: str) -> tuple[dict[str, str], str]:
+    """Decode and strictly validate a gateway launcher snapshot."""
+    if not raw or len(raw) > 32768:
+        raise ValueError("gateway launch environment lock is empty or too large")
+    try:
+        decoded = base64.b64decode(
+            raw.encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+        payload = json.loads(decoded.decode("utf-8"))
+    except (
+        binascii.Error,
+        UnicodeDecodeError,
+        UnicodeEncodeError,
+        json.JSONDecodeError,
+        ValueError,
+    ) as exc:
+        raise ValueError("gateway launch environment lock is malformed") from exc
+
+    if not isinstance(payload, dict) or set(payload) != {"version", "cwd", "env"}:
+        raise ValueError("gateway launch environment lock has an invalid shape")
+    if payload.get("version") != 1:
+        raise ValueError("gateway launch environment lock has an unsupported version")
+
+    cwd = payload.get("cwd")
+    values = payload.get("env")
+    if not isinstance(cwd, str) or not cwd or "\x00" in cwd:
+        raise ValueError("gateway launch environment lock has an invalid cwd")
+    if not isinstance(values, dict) or set(values) != set(_GATEWAY_LAUNCH_ENV_KEYS):
+        raise ValueError("gateway launch environment lock has incomplete variables")
+    for key in _GATEWAY_LAUNCH_ENV_KEYS:
+        value = values.get(key)
+        if not isinstance(value, str) or not value or "\x00" in value:
+            raise ValueError(f"gateway launch environment lock has an invalid {key}")
+    if _normalized_launch_cwd(values["HERMES_HOME"]) != _normalized_launch_cwd(
+        values["HERMES_RUNTIME_HOME"]
+    ):
+        raise ValueError("gateway launch environment lock has mismatched homes")
+    if _normalized_launch_cwd(cwd) != _normalized_launch_cwd(
+        values["GLADLY_HERMES_CODE_ROOT"]
+    ):
+        raise ValueError("gateway launch environment lock has mismatched cwd")
+    return dict(values), cwd
+
+
+def _normalized_launch_cwd(value: str | os.PathLike) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(value))))
+
+
+def _capture_gateway_launch_env_lock() -> None:
+    """Capture a launcher snapshot once, before dotenv can replace it."""
+    global _GATEWAY_LAUNCH_ENV_CAPTURE_ATTEMPTED
+    global _GATEWAY_LAUNCH_ENV_STATE
+    global _GATEWAY_LAUNCH_ENV_ERROR
+
+    with _GATEWAY_LAUNCH_ENV_CAPTURE_MUTEX:
+        if _GATEWAY_LAUNCH_ENV_CAPTURE_ATTEMPTED:
+            if _GATEWAY_LAUNCH_ENV_ERROR:
+                raise RuntimeError(_GATEWAY_LAUNCH_ENV_ERROR)
+            return
+
+        raw = os.environ.pop(_GATEWAY_LAUNCH_ENV_LOCK_VAR, None)
+        _GATEWAY_LAUNCH_ENV_CAPTURE_ATTEMPTED = True
+        if raw is None:
+            return
+
+        try:
+            values, expected_cwd = _decode_gateway_launch_env_lock(raw)
+            actual_cwd = os.getcwd()
+            if _normalized_launch_cwd(actual_cwd) != _normalized_launch_cwd(expected_cwd):
+                raise ValueError("gateway launcher cwd does not match its locked cwd")
+            if any(os.environ.get(key) != value for key, value in values.items()):
+                raise ValueError(
+                    "gateway launcher variables do not match their locked values"
+                )
+            imported_root = _normalized_launch_cwd(Path(__file__).resolve().parent.parent)
+            pythonpath_entries = values["PYTHONPATH"].split(os.pathsep)
+            if not any(
+                entry and _normalized_launch_cwd(entry) == imported_root
+                for entry in pythonpath_entries
+            ):
+                raise ValueError(
+                    "gateway launcher PYTHONPATH does not contain the imported tree"
+                )
+        except (OSError, ValueError) as exc:
+            _GATEWAY_LAUNCH_ENV_ERROR = (
+                "Refusing detached gateway startup because its launch environment "
+                "lock is invalid. Reinstall the gateway service."
+            )
+            raise RuntimeError(_GATEWAY_LAUNCH_ENV_ERROR) from exc
+
+        _GATEWAY_LAUNCH_ENV_STATE = (values, expected_cwd)
+
+
+def _reapply_gateway_launch_env_lock() -> None:
+    """Restore process-local gateway provenance after an overriding source."""
+    # Always discard a marker injected by a dotenv/managed source.  Only the
+    # process-launch value captured before the first load is authoritative.
+    os.environ.pop(_GATEWAY_LAUNCH_ENV_LOCK_VAR, None)
+    with _GATEWAY_LAUNCH_ENV_CAPTURE_MUTEX:
+        if _GATEWAY_LAUNCH_ENV_ERROR:
+            raise RuntimeError(_GATEWAY_LAUNCH_ENV_ERROR)
+        state = _GATEWAY_LAUNCH_ENV_STATE
+        if state is None:
+            return
+        values, _expected_cwd = state
+        for key, value in values.items():
+            os.environ[key] = value
+
+
+def _gateway_launch_env_locked_values() -> dict[str, str] | None:
+    """Return a copy of the active process-local launcher snapshot."""
+    with _GATEWAY_LAUNCH_ENV_CAPTURE_MUTEX:
+        if _GATEWAY_LAUNCH_ENV_STATE is None:
+            return None
+        values, _expected_cwd = _GATEWAY_LAUNCH_ENV_STATE
+        return dict(values)
 
 
 def _known_hermes_env_keys() -> set[str]:
@@ -340,6 +529,29 @@ def _sanitize_loaded_credentials() -> None:
 
 
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
+    locked_values = _gateway_launch_env_locked_values()
+    if locked_values is not None:
+        # Parse into a private mapping and apply only unlocked names. Calling
+        # python-dotenv's load_dotenv() and restoring afterwards leaves a
+        # process-global TOCTOU window where another gateway thread can spawn
+        # a child with stale runtime roots. Filtering at ingestion keeps the
+        # protected names immutable for the whole reload.
+        try:
+            parsed = dotenv_values(dotenv_path=path, encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            raw = path.read_bytes()
+            if raw.startswith(codecs.BOM_UTF8):
+                raw = raw[len(codecs.BOM_UTF8) :]
+            parsed = dotenv_values(stream=io.StringIO(raw.decode("latin-1")))
+        for key, value in parsed.items():
+            if key in locked_values or key == _GATEWAY_LAUNCH_ENV_LOCK_VAR:
+                continue
+            if value is not None and (override or key not in os.environ):
+                os.environ[key] = value
+        _sanitize_loaded_credentials()
+        _latch_cron_dispatch_pause_if_engaged()
+        return
+
     try:
         # utf-8-sig strips a leading UTF-8 BOM if present (PowerShell 5.1
         # Set-Content -Encoding UTF8 / Notepad) and is a no-op for BOM-less
@@ -358,6 +570,24 @@ def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
     # typically come from copy-pasting keys from PDFs or rich-text editors
     # that substitute Unicode lookalike glyphs (e.g. ʋ U+028B for v).
     _sanitize_loaded_credentials()
+    _latch_cron_dispatch_pause_if_engaged()
+
+
+def _latch_cron_dispatch_pause_if_engaged() -> None:
+    """Make a true migration quarantine monotonic across later env reloads."""
+    value = os.getenv("HERMES_CRON_PAUSED", "")
+    if value.strip().casefold() in {"", "0", "false", "no", "off"}:
+        return
+    try:
+        # Lazy import avoids pulling the scheduler store into ordinary CLI
+        # bootstrap unless the emergency switch is actually engaged.
+        from cron.jobs import is_cron_dispatch_paused
+
+        is_cron_dispatch_paused()
+    except ImportError:
+        # An unusually early import cycle will still be caught at the first
+        # dispatch boundary, which calls the same predicate directly.
+        return
 
 
 def _sanitize_env_file_if_needed(path: Path) -> None:
@@ -484,6 +714,11 @@ def load_hermes_dotenv(
       ``load_external_secrets=False`` to avoid loading optional secret-manager
       dependencies into the process that replaces that same environment.
     """
+    # Observe an OS/launcher-injected quarantine before the first
+    # override=True dotenv source gets any opportunity to replace it.
+    _latch_cron_dispatch_pause_if_engaged()
+    _capture_gateway_launch_env_lock()
+    _reapply_gateway_launch_env_lock()
     loaded: list[Path] = []
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
@@ -497,7 +732,10 @@ def load_hermes_dotenv(
         _sanitize_env_file_if_needed(project_env_path)
 
     if user_env.exists():
-        _load_dotenv_with_fallback(user_env, override=True)
+        try:
+            _load_dotenv_with_fallback(user_env, override=True)
+        finally:
+            _reapply_gateway_launch_env_lock()
         loaded.append(user_env)
         # Mirror reload_env() known-key cleanup so inherited Hermes keys
         # absent from this profile's .env do not leak into the runtime.
@@ -515,10 +753,16 @@ def load_hermes_dotenv(
     # ensures .op.env never clobbers a token already in the environment).
     op_env = home_path / ".op.env"
     if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
-        _load_dotenv_with_fallback(op_env, override=False)
+        try:
+            _load_dotenv_with_fallback(op_env, override=False)
+        finally:
+            _reapply_gateway_launch_env_lock()
 
     if project_env_path and project_env_path.exists():
-        _load_dotenv_with_fallback(project_env_path, override=not loaded)
+        try:
+            _load_dotenv_with_fallback(project_env_path, override=not loaded)
+        finally:
+            _reapply_gateway_launch_env_lock()
         loaded.append(project_env_path)
 
     # External secret sources are skipped in two updater situations:
@@ -535,8 +779,16 @@ def load_hermes_dotenv(
     from hermes_cli import _early_recovery
 
     if load_external_secrets and not _early_recovery._should_skip_external_secret_sources():
-        _apply_external_secret_sources(home_path)
-    _apply_managed_env()
+        try:
+            _apply_external_secret_sources(home_path)
+        finally:
+            _latch_cron_dispatch_pause_if_engaged()
+            _reapply_gateway_launch_env_lock()
+    try:
+        _apply_managed_env()
+    finally:
+        _latch_cron_dispatch_pause_if_engaged()
+        _reapply_gateway_launch_env_lock()
 
     # config.yaml is the documented source of truth for terminal.* settings,
     # but the dotenv loads above run with override=True — so a stale
@@ -550,7 +802,10 @@ def load_hermes_dotenv(
     # the documented config path always wins. Runs after _apply_managed_env()
     # so the merged config (which already carries the managed overlay) is
     # what lands in the env.
-    _reapply_terminal_config_bridge(home_path)
+    try:
+        _reapply_terminal_config_bridge(home_path)
+    finally:
+        _reapply_gateway_launch_env_lock()
 
     return loaded
 
@@ -677,10 +932,31 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     except ImportError:
         return
 
+    locked_values = _gateway_launch_env_locked_values()
+    source_environ: dict[str, str] | None = None
+    source_baseline: dict[str, str] | None = None
+    if locked_values is not None:
+        # Secret-source plugins can target arbitrary env names. Apply them to
+        # a private copy, then merge only unlocked keys so a misconfigured
+        # mapping cannot transiently replace launcher provenance in another
+        # gateway thread.
+        source_baseline = dict(os.environ)
+        source_environ = dict(source_baseline)
+
     try:
-        report = apply_all(cfg, home_path)
+        report = apply_all(cfg, home_path, environ=source_environ)
     except Exception:  # noqa: BLE001 — belt-and-braces; apply_all shouldn't raise
+        _latch_cron_dispatch_pause_if_engaged()
         return
+
+    if source_environ is not None:
+        for key, value in source_environ.items():
+            if key in locked_values or key == _GATEWAY_LAUNCH_ENV_LOCK_VAR:
+                continue
+            if source_baseline is not None and source_baseline.get(key) == value:
+                continue
+            os.environ[key] = value
+    _latch_cron_dispatch_pause_if_engaged()
 
     if not report.sources:
         # Config parsed but no source is enabled: keep retrying cheaply
@@ -707,8 +983,9 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         values: dict[str, str] = {}
         for name, applied in report.provenance.items():
             _SECRET_SOURCES[name] = applied.source
-            if name in os.environ:
-                values[name] = os.environ[name]
+            effective_environ = source_environ or os.environ
+            if name in effective_environ and name not in (locked_values or {}):
+                values[name] = effective_environ[name]
         _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
 
     for src in report.sources:
