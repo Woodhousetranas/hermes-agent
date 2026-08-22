@@ -493,7 +493,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import (
-    advance_next_runs,
+    advance_next_runs,  # noqa: F401 - retained scheduler compatibility hook
     claim_dispatch,
     claim_job_for_fire,
     fire_claim_fence,
@@ -501,8 +501,10 @@ from cron.jobs import (
     get_due_jobs,
     heartbeat_fire_claim,
     heartbeat_run_claim,
+    is_cron_dispatch_paused,
     mark_job_run,
     mark_job_skip,
+    release_fire_claim,
     save_job_output,
     use_cron_store,
 )
@@ -3490,14 +3492,35 @@ def _run_job_script(
     # choice explicit here keeps the allowed surface small and auditable.
     suffix = path.suffix.lower()
     if suffix in {".sh", ".bash"}:
-        # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
-        # all work.  On native Windows without Git for Windows installed
-        # shutil.which returns None — fall back to a clear error rather
-        # than a FileNotFoundError with a confusing "[WinError 2]"
-        # traceback.
-        _bash = shutil.which("bash") or (
-            "/bin/bash" if os.path.isfile("/bin/bash") else None
-        )
+        # Managed runtimes can pin an exact Bash identity.  Once explicitly
+        # configured, fail closed if that file is absent or invalid: silently
+        # falling back to PATH would execute a different toolchain than the
+        # reviewed runtime manifest.  Unset keeps the historical upstream
+        # discovery behavior for ordinary installations.
+        _explicit_bash = os.environ.get("HERMES_BASH_EXE")
+        if _explicit_bash is not None:
+            try:
+                _bash_path = Path(_explicit_bash.strip()).expanduser().resolve(
+                    strict=True
+                )
+            except (OSError, RuntimeError, ValueError):
+                _bash_path = None
+            if _bash_path is None or not _bash_path.is_file():
+                return False, (
+                    f"Cannot run .sh/.bash script {path.name!r}: explicit "
+                    "HERMES_BASH_EXE does not point to an existing file; "
+                    "PATH fallback is disabled."
+                )
+            _bash = str(_bash_path)
+        else:
+            # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
+            # all work.  On native Windows without Git for Windows installed
+            # shutil.which returns None — fall back to a clear error rather
+            # than a FileNotFoundError with a confusing "[WinError 2]"
+            # traceback.
+            _bash = shutil.which("bash") or (
+                "/bin/bash" if os.path.isfile("/bin/bash") else None
+            )
         if _bash is None:
             return False, (
                 f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
@@ -6077,6 +6100,61 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         heartbeat_thread.join(timeout=1.0)
 
 
+def cancel_claimed_fire_for_pause(job: dict) -> None:
+    """Close an admitted-but-unstarted fire after quarantine engages.
+
+    Claim acquisition advances recurring schedules (and a forced claim may
+    resume a paused record), so merely skipping ``run_one_job`` would consume
+    a due occurrence.  Roll back the exact claim snapshot when still owned and
+    close the already-created execution row as an explicit unstarted attempt.
+    """
+    claim = job.get("fire_claim")
+    owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+    if owner:
+        try:
+            release_fire_claim(
+                str(job.get("id") or ""),
+                expected_owner=owner,
+                restore_snapshot=job.get("_fire_claim_restore"),
+            )
+        except Exception:
+            logger.warning(
+                "Job '%s': failed to release quarantined fire claim",
+                job.get("id", "?"),
+                exc_info=True,
+            )
+    run_claim = job.get("run_claim")
+    run_owner = (
+        str(run_claim.get("by") or "") if isinstance(run_claim, dict) else ""
+    )
+    if run_owner:
+        try:
+            clear_run_claim(
+                str(job.get("id") or ""),
+                expected_owner=run_owner,
+            )
+        except Exception:
+            logger.warning(
+                "Job '%s': failed to release quarantined one-shot run claim",
+                job.get("id", "?"),
+                exc_info=True,
+            )
+    execution_id = job.get("execution_id")
+    if execution_id:
+        try:
+            finish_execution(
+                execution_id,
+                success=False,
+                error="Cron dispatch paused before execution started.",
+            )
+        except Exception:
+            logger.warning(
+                "Job '%s': failed to close quarantined execution row",
+                job.get("id", "?"),
+                exc_info=True,
+            )
+
+
 def run_one_job(
     job: dict,
     *,
@@ -6105,6 +6183,13 @@ def run_one_job(
     run cooperatively — agent interruption AND script process-tree kill —
     through the single fenced completion path.
     """
+    # A provider/tick may have won its durable claim immediately before a
+    # runtime reload engaged quarantine.  This is the final shared boundary
+    # before any execution bookkeeping, agent/script work, or delivery.
+    if is_cron_dispatch_paused():
+        cancel_claimed_fire_for_pause(job)
+        return True
+
     claim = job.get("fire_claim")
     fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     execution_token = object()
@@ -6708,6 +6793,13 @@ def tick(
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
+    # Host-migration quarantine: leave every due record untouched.  This is
+    # deliberately before lock-directory creation and, critically, before the
+    # due scan so Desktop/manual tick paths cannot bypass the gateway gate.
+    if is_cron_dispatch_paused():
+        logger.debug("Cron dispatch paused by HERMES_CRON_PAUSED")
+        return 0
+
     lock_dir, lock_file = _get_lock_paths()
     lock_dir.mkdir(parents=True, exist_ok=True)
 
@@ -6803,6 +6895,32 @@ def tick(
 
         due_jobs = get_due_jobs()
 
+        # A reload can engage quarantine while the due scan is in progress.
+        # Re-check before the first pre-dispatch schedule mutation; one-shot
+        # run_claims stamped by the scan are released owner-safely.
+        if is_cron_dispatch_paused():
+            for _due_job in due_jobs:
+                _run_claim = _due_job.get("run_claim")
+                _run_owner = (
+                    str(_run_claim.get("by") or "")
+                    if isinstance(_run_claim, dict)
+                    else ""
+                )
+                if not _run_owner:
+                    continue
+                try:
+                    clear_run_claim(
+                        str(_due_job.get("id") or ""),
+                        expected_owner=_run_owner,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not release one-shot run claim after cron pause",
+                        exc_info=True,
+                    )
+            logger.debug("Cron dispatch paused before due jobs were advanced")
+            return 0
+
         # Bound the in-flight set BEFORE the dedup guard is consulted, so a
         # leaked claim is force-released in-cycle rather than silently eating
         # every subsequent fire until the gateway process restarts. Skips the
@@ -6845,17 +6963,11 @@ def tick(
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, the advance keeps
-        # bumping next_run_at forward so the grace window never expires.
-        # mark_job_run() overwrites next_run_at on completion.
-        # Batched: one load + one save for the whole due set, not one per job.
-        # Composes with the claim-time advance in claim_job_for_fire: for
-        # cron-kind jobs both compute the same next occurrence; interval jobs
-        # re-anchor from their own "now" at claim time (harmless for
-        # at-most-once — mark_job_run re-anchors at completion regardless).
-        advance_next_runs([job["id"] for job in due_jobs])
+        # Do NOT advance recurring schedules here.  The worker-side
+        # claim_job_for_fire CAS is the single owner-fenced pre-execution
+        # advance.  Advancing the whole due set before workers claim it loses
+        # an occurrence if migration quarantine engages between this point
+        # and claim acquisition (or if a job remains queued behind the pool).
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
@@ -6894,17 +7006,23 @@ def tick(
             # This prevents a queued lease from expiring before execution.
             claimed = claim_job_for_fire(job["id"], return_job=True)
             if not claimed:
-                finish_execution(
-                    job["execution_id"],
-                    success=False,
-                    error="Fire claim lost; execution was not started.",
-                )
+                if is_cron_dispatch_paused():
+                    cancel_claimed_fire_for_pause(job)
+                else:
+                    finish_execution(
+                        job["execution_id"],
+                        success=False,
+                        error="Fire claim lost; execution was not started.",
+                    )
                 return True
             # Production CAS returns the exact persisted record with its unique
             # owner. Bool fallback keeps older test doubles/API overrides
             # compatible; real callers using return_job=True never take it.
             claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
             claimed_job["execution_id"] = job["execution_id"]
+            if is_cron_dispatch_paused():
+                cancel_claimed_fire_for_pause(claimed_job)
+                return True
             return run_one_job(
                 claimed_job,
                 adapters=adapters,

@@ -12813,6 +12813,11 @@ def _fire_cron_job_for_profile(
     token = set_hermes_home_override(str(home))
     try:
         with cron_jobs.use_cron_store(home):
+            if cron_jobs.is_cron_dispatch_paused():
+                raise HTTPException(
+                    status_code=503,
+                    detail="Cron dispatch is paused for runtime migration",
+                )
             provider = resolve_cron_scheduler()
             if force:
                 if not provider_supports_force_fire(provider):
@@ -12823,8 +12828,18 @@ def _fire_cron_job_for_profile(
                             "does not support atomic forced firing of paused jobs"
                         ),
                     )
+                if cron_jobs.is_cron_dispatch_paused():
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Cron dispatch is paused for runtime migration",
+                    )
                 return bool(
                     provider.fire_due(job_id, adapters=None, loop=None, force=True)
+                )
+            if cron_jobs.is_cron_dispatch_paused():
+                raise HTTPException(
+                    status_code=503,
+                    detail="Cron dispatch is paused for runtime migration",
                 )
             return bool(provider.fire_due(job_id, adapters=None, loop=None))
     finally:

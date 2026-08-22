@@ -200,6 +200,31 @@ def test_quarantine_falls_back_to_reboot_schedule(_winp, tmp_path, capsys, monke
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
+def test_legacy_manual_restart_inventory_never_scans_or_kills_on_windows(
+    _winp, monkeypatch
+):
+    import hermes_cli.gateway as gateway_mod
+
+    monkeypatch.setattr(
+        gateway_mod,
+        "_get_service_pids",
+        lambda: pytest.fail("Windows legacy restart queried service PIDs"),
+    )
+    monkeypatch.setattr(
+        gateway_mod,
+        "find_gateway_pids",
+        lambda **kwargs: pytest.fail("Windows legacy restart scanned gateways"),
+    )
+    monkeypatch.setattr(
+        gateway_mod,
+        "find_profile_gateway_processes",
+        lambda **kwargs: pytest.fail("Windows legacy restart mapped gateways"),
+    )
+
+    assert cli_main._legacy_manual_gateway_restart_inventory() == (set(), [], {})
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
 def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
     _winp,
     monkeypatch,
@@ -229,7 +254,7 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
     monkeypatch.setattr(cli_main, "_wait_for_windows_update_gateway_exit", fake_wait)
     monkeypatch.setattr(
         gateway_mod,
-        "_capture_gateway_argv",
+        "_capture_current_install_gateway_argv",
         lambda pid: ["pythonw.exe", "-m", "hermes_cli.main", "gateway", "run"]
         if pid == 202
         else None,
@@ -268,6 +293,356 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
     # An unmapped PID whose argv we captured is respawnable, so we must NOT
     # tell the user to restart it manually.
     assert "Restart manually after update" not in captured
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_pause_unions_pid_file_mapped_gateway_missing_from_raw_scan(
+    _winp,
+    monkeypatch,
+    tmp_path,
+):
+    import hermes_cli.gateway as gateway_mod
+
+    profile_home = tmp_path / "profiles" / "work"
+    profile_home.mkdir(parents=True)
+    profile_proc = SimpleNamespace(profile="work", path=profile_home, pid=303)
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [])
+    monkeypatch.setattr(
+        gateway_mod,
+        "find_profile_gateway_processes",
+        lambda **_k: [profile_proc],
+    )
+    monkeypatch.setattr(gateway_mod, "_get_restart_drain_timeout", lambda: 0.1)
+    monkeypatch.setattr(cli_main, "_venv_launcher_ancestors", lambda _pids: [])
+    waited_for = []
+    monkeypatch.setattr(
+        cli_main,
+        "_wait_for_windows_update_gateway_exit",
+        lambda pids, *, timeout: waited_for.extend(pids) or set(),
+    )
+
+    token = cli_main._pause_windows_gateways_for_update()
+
+    assert token == {
+        "resume_needed": True,
+        "profiles": {"work": 303},
+        "unmapped_pids": [],
+        "unmapped": [],
+    }
+    assert waited_for == [303]
+    marker = json.loads((profile_home / ".gateway-planned-stop.json").read_text())
+    assert marker["target_pid"] == 303
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_pause_scan_failure_is_explicit(_winp, monkeypatch):
+    import hermes_cli.gateway as gateway_mod
+    import hermes_cli.update_cmd as update_cmd
+
+    def fail_scan(**_kwargs):
+        raise OSError("process table unavailable")
+
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids", fail_scan)
+
+    with pytest.raises(update_cmd._WindowsGatewayPauseDiscoveryError):
+        cli_main._pause_windows_gateways_for_update()
+
+
+def test_strict_windows_gateway_scan_rejects_failed_wmic_and_cim(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.gateway as gateway_mod
+    import hermes_cli._subprocess_compat as subprocess_compat
+
+    monkeypatch.setattr(gateway_mod, "is_windows", lambda: True)
+    monkeypatch.setattr(gateway_mod, "_get_ancestor_pids", lambda: set())
+    monkeypatch.setattr(gateway_mod, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(gateway_mod, "_profile_arg", lambda _home: "")
+    monkeypatch.setattr(
+        gateway_mod.shutil,
+        "which",
+        lambda name: f"{name}.exe" if name in {"wmic", "powershell"} else None,
+    )
+    probes = []
+    monkeypatch.setattr(
+        subprocess_compat,
+        "bounded_probe_run",
+        lambda command, **kwargs: probes.append((command, kwargs)) or None,
+    )
+
+    with pytest.raises(RuntimeError, match="CIM scan did not complete"):
+        gateway_mod._scan_gateway_pids(set(), all_profiles=True, strict=True)
+
+    assert [Path(command[0]).stem for command, _kwargs in probes] == [
+        "wmic",
+        "powershell",
+    ]
+
+
+def test_strict_profile_gateway_discovery_rejects_enumeration_failure(
+    monkeypatch
+):
+    import hermes_cli.gateway as gateway_mod
+    import hermes_cli.profiles as profiles_mod
+
+    monkeypatch.setattr(
+        profiles_mod,
+        "list_profiles",
+        lambda: (_ for _ in ()).throw(OSError("profile root unreadable")),
+    )
+
+    with pytest.raises(RuntimeError, match="enumerate Hermes profiles"):
+        gateway_mod.find_profile_gateway_processes(strict=True)
+
+
+def test_update_aborts_before_fetch_when_windows_gateway_scan_fails(
+    monkeypatch, tmp_path, capsys
+):
+    import hermes_cli.gateway as gateway_mod
+    import hermes_cli.update_cmd as update_cmd
+
+    monkeypatch.setattr(cli_main, "_is_windows", lambda: True)
+    monkeypatch.setattr(cli_main, "_capture_active_lazy_features", lambda: [])
+    monkeypatch.setattr(cli_main, "_capture_active_tool_dependencies", lambda: [])
+    monkeypatch.setattr(cli_main, "_run_pre_update_backup", lambda _args: None)
+    monkeypatch.setattr(update_cmd, "_read_project_version", lambda: "0.0.0")
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        gateway_mod,
+        "find_gateway_pids",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            OSError("process table unavailable")
+        ),
+    )
+    subprocess_calls = []
+    monkeypatch.setattr(
+        update_cmd.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess_calls.append((args, kwargs)),
+    )
+
+    args = SimpleNamespace(
+        yes=True,
+        force=True,
+        force_venv=True,
+        branch=None,
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        update_cmd._cmd_update_impl(args, gateway_mode=False)
+
+    assert exc_info.value.code == 2
+    assert subprocess_calls == []
+    output = capsys.readouterr().out
+    assert "gateway state is unknown" in output
+    assert "No checkout or dependency changes were made" in output
+
+
+def _fake_gateway_process(argv, *, cwd, environ):
+    class FakeProcess:
+        def __init__(self, _pid):
+            pass
+
+        def cmdline(self):
+            return list(argv)
+
+        def cwd(self):
+            return str(cwd)
+
+        def environ(self):
+            return dict(environ)
+
+    return types.SimpleNamespace(Process=FakeProcess)
+
+
+def test_unmapped_restart_capture_pins_the_process_runtime_profile(
+    monkeypatch, tmp_path
+):
+    """An unmapped current-install gateway keeps its actual named profile."""
+    import hermes_cli.gateway as gateway_mod
+
+    project = tmp_path / "current" / "hermes-agent"
+    runtime_root = tmp_path / "current" / "home"
+    work_home = runtime_root / "profiles" / "work"
+    project.mkdir(parents=True)
+    work_home.mkdir(parents=True)
+    argv = ["python.exe", "-m", "hermes_cli.main", "gateway", "run"]
+    process_env = {
+        "HERMES_HOME": str(work_home),
+        "HERMES_RUNTIME_HOME": str(work_home),
+        "GLADLY_HERMES_CODE_ROOT": str(project),
+        "PYTHONPATH": str(project),
+    }
+    monkeypatch.setattr(gateway_mod, "PROJECT_ROOT", project)
+    monkeypatch.setattr(gateway_mod, "get_hermes_home", lambda: runtime_root)
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        _fake_gateway_process(argv, cwd=project, environ=process_env),
+    )
+
+    captured = gateway_mod._capture_current_install_gateway_argv(202)
+
+    assert captured == [
+        "python.exe",
+        "-m",
+        "hermes_cli.main",
+        "--profile",
+        "work",
+        "gateway",
+        "run",
+    ]
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_pause_leaves_cross_root_unmapped_gateway_untouched(
+    _winp,
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    """A host-wide scan must not stop/replay another Hermes installation."""
+    import gateway.status as status_mod
+    import hermes_cli.gateway as gateway_mod
+    import hermes_cli.gateway_windows as gateway_windows
+
+    current_project = tmp_path / "current" / "hermes-agent"
+    current_home = tmp_path / "current" / "home"
+    foreign_project = tmp_path / "foreign" / "hermes-agent"
+    foreign_home = tmp_path / "foreign" / "home"
+    for path in (current_project, current_home, foreign_project, foreign_home):
+        path.mkdir(parents=True)
+    argv = ["python.exe", "-m", "hermes_cli.main", "gateway", "run"]
+    foreign_env = {
+        "HERMES_HOME": str(foreign_home),
+        "HERMES_RUNTIME_HOME": str(foreign_home),
+        "GLADLY_HERMES_CODE_ROOT": str(foreign_project),
+        "PYTHONPATH": str(foreign_project),
+    }
+    monkeypatch.setattr(gateway_mod, "PROJECT_ROOT", current_project)
+    monkeypatch.setattr(gateway_mod, "get_hermes_home", lambda: current_home)
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [202])
+    monkeypatch.setattr(
+        gateway_mod, "find_profile_gateway_processes", lambda **_k: []
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        _fake_gateway_process(argv, cwd=foreign_project, environ=foreign_env),
+    )
+    terminated = []
+    monkeypatch.setattr(
+        status_mod,
+        "terminate_pid",
+        lambda pid, force=False: terminated.append((pid, force)),
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_wait_for_windows_update_gateway_exit",
+        lambda *_args, **_kwargs: pytest.fail("foreign gateway must not be drained"),
+    )
+    monkeypatch.setattr(gateway_windows, "is_installed", lambda: True)
+    monkeypatch.setattr(gateway_windows, "is_autostart_enabled", lambda: True)
+
+    token = cli_main._pause_windows_gateways_for_update()
+
+    assert token == {
+        "resume_needed": True,
+        "profiles": {},
+        "unmapped_pids": [],
+        "unmapped": [],
+        "cold_start_if_installed": True,
+    }
+    assert terminated == []
+    assert "other-installation" in capsys.readouterr().out
+
+    refreshed = []
+    cold_started = []
+    monkeypatch.setattr(
+        cli_main,
+        "_refresh_windows_gateway_launchers",
+        lambda: refreshed.append(True),
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_cold_start_windows_gateway_after_update",
+        lambda: cold_started.append(True),
+    )
+
+    cli_main._resume_windows_gateways_after_update(token)
+
+    assert refreshed == [True]
+    assert cold_started == [True]
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_disabled_installed_task_refreshes_but_never_cold_starts(
+    _winp,
+    monkeypatch,
+):
+    import hermes_cli.gateway as gateway_mod
+    import hermes_cli.gateway_windows as gateway_windows
+
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [])
+    monkeypatch.setattr(
+        gateway_mod, "find_profile_gateway_processes", lambda **_k: []
+    )
+    monkeypatch.setattr(gateway_windows, "is_installed", lambda: True)
+    monkeypatch.setattr(gateway_windows, "is_autostart_enabled", lambda: False)
+
+    token = cli_main._pause_windows_gateways_for_update()
+
+    assert token and token["cold_start_if_installed"] is False
+    refreshed = []
+    monkeypatch.setattr(
+        cli_main,
+        "_refresh_windows_gateway_launchers",
+        lambda: refreshed.append(True),
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_cold_start_windows_gateway_after_update",
+        lambda: pytest.fail("disabled task must remain quarantined"),
+    )
+
+    cli_main._resume_windows_gateways_after_update(token)
+
+    assert refreshed == [True]
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_other_installed_profile_still_requests_launcher_refresh(
+    _winp,
+    monkeypatch,
+    tmp_path,
+):
+    import hermes_cli.gateway as gateway_mod
+    import hermes_cli.gateway_windows as gateway_windows
+
+    work_home = tmp_path / "home" / "profiles" / "work"
+    work_home.mkdir(parents=True)
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [])
+    monkeypatch.setattr(
+        gateway_mod, "find_profile_gateway_processes", lambda **_k: []
+    )
+    monkeypatch.setattr(gateway_windows, "is_installed", lambda: False)
+    monkeypatch.setattr(
+        gateway_windows, "get_installed_profile_homes", lambda: [work_home]
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "is_autostart_enabled",
+        lambda: pytest.fail("a different profile must not cold-start current"),
+    )
+
+    token = cli_main._pause_windows_gateways_for_update()
+
+    assert token == {
+        "resume_needed": True,
+        "profiles": {},
+        "unmapped_pids": [],
+        "unmapped": [],
+        "cold_start_if_installed": False,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -428,9 +803,9 @@ def test_pause_kill_set_covers_venv_guard_abort_set(
 # sees the process table as it is NOW. A supervisor (Scheduled Task, login
 # watchdog) can respawn a gateway inside the pause→guard window, and some
 # spawn paths never register in discovery at all. Those holders are exactly
-# what the pause machinery exists to stop — the guard nominates them for a
-# stop-and-recheck instead of dead-ending, and refuses the moment any
-# non-gateway holder is present.
+# what the pause machinery exists to stop — but only after current-install
+# provenance is proved and a replay argv is captured. The guard refuses the
+# moment any holder is foreign, unverified, or not a gateway.
 # ---------------------------------------------------------------------------
 
 
@@ -443,71 +818,58 @@ GATEWAY_ARGV = [
 ]
 
 
-def _fake_psutil_cmdlines(argv_by_pid):
-    """psutil stand-in serving live argv per pid; unknown pids raise."""
-
-    class FakeProc:
-        def __init__(self, pid):
-            if pid not in argv_by_pid:
-                raise ValueError(f"no such pid {pid}")
-            self._argv = argv_by_pid[pid]
-
-        def cmdline(self):
-            return self._argv
-
-    return types.SimpleNamespace(Process=FakeProc)
-
-
 def test_leftover_holders_that_are_all_gateways_are_nominated(monkeypatch):
-    """Respawned/unmapped gateway holders get stopped, not dead-ended on."""
-    monkeypatch.setitem(
-        sys.modules,
-        "psutil",
-        _fake_psutil_cmdlines({300: GATEWAY_ARGV, 301: GATEWAY_ARGV}),
+    """Proven current gateways carry replay argv before they can be stopped."""
+    import hermes_cli.gateway as gateway_mod
+
+    monkeypatch.setattr(
+        gateway_mod,
+        "_capture_current_install_gateway_argv",
+        lambda pid: [*GATEWAY_ARGV, "--pid", str(pid)],
     )
+    gateway_prefix = " ".join(GATEWAY_ARGV)
     matches = [
-        (300, "python.exe", "truncated..."),
-        (301, "python.exe", "truncated..."),
+        (300, "python.exe", gateway_prefix),
+        (301, "python.exe", gateway_prefix),
     ]
 
-    assert cli_main._leftover_pausable_gateway_pids(matches) == [300, 301]
+    assert cli_main._leftover_pausable_gateway_pids(matches) == [
+        {"pid": 300, "argv": [*GATEWAY_ARGV, "--pid", "300"]},
+        {"pid": 301, "argv": [*GATEWAY_ARGV, "--pid", "301"]},
+    ]
 
 
 def test_one_non_gateway_holder_keeps_the_hard_refusal(monkeypatch):
     """A REPL/backend holder means the guard must abort exactly as before."""
-    monkeypatch.setitem(
-        sys.modules,
-        "psutil",
-        _fake_psutil_cmdlines(
-            {300: GATEWAY_ARGV, 400: [r"C:\x\venv\Scripts\python.exe", "-i"]}
-        ),
+    import hermes_cli.gateway as gateway_mod
+
+    monkeypatch.setattr(
+        gateway_mod,
+        "_capture_current_install_gateway_argv",
+        lambda pid: GATEWAY_ARGV,
     )
-    matches = [(300, "python.exe", "..."), (400, "python.exe", "...")]
+    matches = [
+        (300, "python.exe", " ".join(GATEWAY_ARGV)),
+        (400, "python.exe", r"C:\x\venv\Scripts\python.exe -i"),
+    ]
 
     assert cli_main._leftover_pausable_gateway_pids(matches) is None
 
 
-def test_unreadable_argv_falls_back_to_the_captured_prefix(monkeypatch):
-    """psutil failure degrades to the scan's captured cmdline, not a crash.
+def test_unverified_gateway_holder_keeps_the_hard_refusal(monkeypatch):
+    """Gateway-shaped argv alone never grants authority to kill a process."""
+    import hermes_cli.gateway as gateway_mod
 
-    The captured prefix decides: a gateway invocation still qualifies, and
-    anything else still refuses.
-    """
-    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil_cmdlines({}))
+    monkeypatch.setattr(
+        gateway_mod,
+        "_capture_current_install_gateway_argv",
+        lambda pid: None,
+    )
     gateway_prefix = r"venv\Scripts\python.exe -m hermes_cli.main gateway run"
 
     assert cli_main._leftover_pausable_gateway_pids(
         [(300, "python.exe", gateway_prefix)]
-    ) == [300]
-    assert (
-        cli_main._leftover_pausable_gateway_pids(
-            [
-                (300, "python.exe", gateway_prefix),
-                (400, "python.exe", "python.exe -i"),
-            ]
-        )
-        is None
-    )
+    ) is None
 
 
 
@@ -522,7 +884,3 @@ def test_unreadable_argv_falls_back_to_the_captured_prefix(monkeypatch):
 # ---------------------------------------------------------------------------
 # cmd_update integration — concurrent-instance gate
 # ---------------------------------------------------------------------------
-
-
-
-

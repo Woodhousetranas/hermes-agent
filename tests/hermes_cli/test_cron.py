@@ -12,6 +12,15 @@ from hermes_cli.cron import cron_command
 from hermes_cli.subcommands.cron import build_cron_parser
 
 
+@pytest.fixture(autouse=True)
+def reset_cron_pause_latch():
+    import cron.jobs as jobs
+
+    jobs._reset_cron_dispatch_pause_latch_for_tests()
+    yield
+    jobs._reset_cron_dispatch_pause_latch_for_tests()
+
+
 @pytest.fixture()
 def tmp_cron_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
@@ -127,6 +136,18 @@ class TestCronCommandLifecycle:
         assert len(jobs) == 1
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
+
+
+def test_cron_status_surfaces_dispatch_quarantine(tmp_cron_dir, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_CRON_PAUSED", "true")
+    monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "builtin")
+
+    cron_cli.cron_status()
+
+    output = capsys.readouterr().out
+    assert "Cron dispatch is PAUSED" in output
+    assert "manual force cannot run" in output
+    assert "Gateway messaging can remain online" in output
 
 
 

@@ -21,6 +21,15 @@ from cron.scheduler_provider import (
 )
 
 
+@pytest.fixture(autouse=True)
+def reset_cron_pause_latch():
+    import cron.jobs as jobs
+
+    jobs._reset_cron_dispatch_pause_latch_for_tests()
+    yield
+    jobs._reset_cron_dispatch_pause_latch_for_tests()
+
+
 @pytest.fixture()
 def tmp_cron_dir(tmp_path, monkeypatch):
     """Redirect cron storage to a temp directory."""
@@ -81,6 +90,76 @@ class TestFireOverdueJobs:
         assert fire_overdue_jobs(provider) == 1
         assert provider.wait_fired()
         assert provider.fired == [job["id"]]
+
+    def test_global_pause_blocks_custom_split_provider_override(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        job = create_job(prompt="p", schedule="every 1h")
+        _park_in_past(job["id"], minutes=30)
+        calls = []
+
+        class UnsafeProvider(RecordingProvider):
+            def claim_fire(self, job_id, *, force=False):
+                calls.append(("claim", job_id))
+                return super().claim_fire(job_id, force=force)
+
+            def fire_claimed(self, claimed_job, **kwargs):
+                calls.append(("fire", claimed_job["id"]))
+                return True
+
+        monkeypatch.setenv("HERMES_CRON_PAUSED", "true")
+
+        assert fire_overdue_jobs(UnsafeProvider()) == 0
+        assert calls == []
+        assert get_job(job["id"])["next_run_at"] < _hermes_now().isoformat()
+
+    def test_pause_after_custom_claim_restores_occurrence(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        job = create_job(prompt="p", schedule="every 1h")
+        _park_in_past(job["id"], minutes=30)
+        due_before = get_job(job["id"])["next_run_at"]
+        calls = []
+
+        class PausingProvider(RecordingProvider):
+            def claim_fire(self, job_id, *, force=False):
+                claimed = super().claim_fire(job_id, force=force)
+                monkeypatch.setenv("HERMES_CRON_PAUSED", "true")
+                return claimed
+
+            def fire_claimed(self, claimed_job, **kwargs):
+                calls.append(claimed_job["id"])
+                return True
+
+        assert fire_overdue_jobs(PausingProvider()) == 0
+        assert calls == []
+        restored = get_job(job["id"])
+        assert restored["next_run_at"] == due_before
+        assert "fire_claim" not in restored
+
+    def test_pause_at_worker_boundary_restores_claim_without_dispatch(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        job = create_job(prompt="p", schedule="every 1h")
+        _park_in_past(job["id"], minutes=30)
+        due_before = get_job(job["id"])["next_run_at"]
+        provider = RecordingProvider()
+
+        class PausingThread:
+            def __init__(self, *, target, **kwargs):
+                self._target = target
+
+            def start(self):
+                monkeypatch.setenv("HERMES_CRON_PAUSED", "true")
+                self._target()
+
+        monkeypatch.setattr(threading, "Thread", PausingThread)
+
+        assert fire_overdue_jobs(provider) == 1
+        assert provider.fired == []
+        restored = get_job(job["id"])
+        assert restored["next_run_at"] == due_before
+        assert "fire_claim" not in restored
 
     def test_respects_grace_window(self, tmp_cron_dir):
         """A job only a few minutes overdue is still the external

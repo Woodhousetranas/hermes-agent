@@ -2,8 +2,20 @@ import codecs
 import importlib
 import os
 import sys
+from pathlib import Path
+
+import pytest
 
 from hermes_cli.env_loader import load_hermes_dotenv
+
+
+@pytest.fixture(autouse=True)
+def reset_cron_pause_latch():
+    import cron.jobs as jobs
+
+    jobs._reset_cron_dispatch_pause_latch_for_tests()
+    yield
+    jobs._reset_cron_dispatch_pause_latch_for_tests()
 
 
 def test_recovered_update_retry_skips_external_secret_sources(tmp_path, monkeypatch):
@@ -349,6 +361,331 @@ def test_cp1252_env_regression_does_not_crash(tmp_path, monkeypatch):
     assert os.getenv("LATIN1_VALUE") == "café"
     # Sanitize must not have rewritten (would have persisted U+FFFD).
     assert env_file.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# Detached gateway launch provenance lock
+# ---------------------------------------------------------------------------
+
+
+def _reset_gateway_launch_env_lock(monkeypatch):
+    import hermes_cli.env_loader as env_loader
+
+    monkeypatch.setattr(
+        env_loader, "_GATEWAY_LAUNCH_ENV_CAPTURE_ATTEMPTED", False
+    )
+    monkeypatch.setattr(env_loader, "_GATEWAY_LAUNCH_ENV_STATE", None)
+    monkeypatch.setattr(env_loader, "_GATEWAY_LAUNCH_ENV_ERROR", None)
+    monkeypatch.delenv(env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR, raising=False)
+    return env_loader
+
+
+def test_gateway_launch_env_lock_survives_dotenv_and_later_reload(
+    tmp_path, monkeypatch
+):
+    """Launcher provenance beats user/project/managed reloads for process life."""
+    env_loader = _reset_gateway_launch_env_lock(monkeypatch)
+    reviewed_cwd = tmp_path / "reviewed-repo"
+    home = tmp_path / "runtime-home"
+    venv = tmp_path / "reviewed-venv"
+    reviewed_cwd.mkdir()
+    home.mkdir()
+    venv.mkdir()
+    monkeypatch.chdir(reviewed_cwd)
+
+    locked = {
+        "HERMES_HOME": str(home),
+        "HERMES_RUNTIME_HOME": str(home),
+        "GLADLY_HERMES_CODE_ROOT": str(reviewed_cwd),
+        "PYTHONPATH": str(Path(env_loader.__file__).resolve().parent.parent),
+        "VIRTUAL_ENV": str(venv),
+    }
+    for key, value in locked.items():
+        monkeypatch.setenv(key, value)
+    marker = env_loader._encode_gateway_launch_env_lock(locked, reviewed_cwd)
+    monkeypatch.setenv(env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR, marker)
+
+    poison = str(tmp_path / "old-host")
+    (home / ".env").write_text(
+        "\n".join(
+            [
+                *(f"{key}={poison}" for key in locked),
+                f"{env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR}=not-the-launch-marker",
+                "LOCK_RELOAD_PROBE=first",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    def poison_managed_env():
+        for key in locked:
+            os.environ[key] = poison + "-managed"
+
+    def poison_config_bridge(_home):
+        for key in locked:
+            os.environ[key] = poison + "-config"
+
+    monkeypatch.setattr(env_loader, "_apply_managed_env", poison_managed_env)
+    monkeypatch.setattr(
+        env_loader, "_reapply_terminal_config_bridge", poison_config_bridge
+    )
+
+    env_loader.load_hermes_dotenv(load_external_secrets=False)
+
+    assert {key: os.environ[key] for key in locked} == locked
+    assert env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR not in os.environ
+    assert os.getcwd() == str(reviewed_cwd)
+    assert os.environ["LOCK_RELOAD_PROBE"] == "first"
+
+    # Simulate arbitrary in-process mutation before the gateway's per-turn
+    # dotenv reload. The captured snapshot, not a newly injected marker, wins.
+    for key in locked:
+        monkeypatch.setenv(key, poison + "-between-turns")
+    monkeypatch.setenv(env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR, "replacement")
+    (home / ".env").write_text(
+        (home / ".env").read_text(encoding="utf-8").replace("first", "second"),
+        encoding="utf-8",
+    )
+
+    env_loader.load_hermes_dotenv(load_external_secrets=False)
+
+    assert {key: os.environ[key] for key in locked} == locked
+    assert env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR not in os.environ
+    assert os.environ["LOCK_RELOAD_PROBE"] == "second"
+
+
+def test_gateway_launch_env_lock_isolates_external_secret_source_mapping(
+    tmp_path, monkeypatch
+):
+    """Secret plugins never receive process-global protected keys to mutate."""
+    from types import SimpleNamespace
+
+    from agent.secret_sources import registry
+
+    env_loader = _reset_gateway_launch_env_lock(monkeypatch)
+    home = tmp_path / "home"
+    reviewed_cwd = tmp_path / "reviewed"
+    home.mkdir()
+    reviewed_cwd.mkdir()
+    locked = {
+        "HERMES_HOME": str(home),
+        "HERMES_RUNTIME_HOME": str(home),
+        "GLADLY_HERMES_CODE_ROOT": str(reviewed_cwd),
+        "PYTHONPATH": str(Path(env_loader.__file__).resolve().parent.parent),
+        "VIRTUAL_ENV": str(tmp_path / "venv"),
+    }
+    for key, value in locked.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("HERMES_CRON_PAUSED", "false")
+    monkeypatch.setattr(
+        env_loader,
+        "_GATEWAY_LAUNCH_ENV_STATE",
+        (dict(locked), str(reviewed_cwd)),
+    )
+    monkeypatch.setattr(env_loader, "_APPLIED_HOMES", set())
+    monkeypatch.setattr(
+        env_loader,
+        "_load_secrets_config",
+        lambda _home: {"test-source": {"enabled": True}},
+    )
+
+    def fake_apply_all(_cfg, _home, *, environ=None):
+        assert environ is not None
+        assert environ is not os.environ
+        # Simulate an operator pausing dispatch while a slow vault fetch is in
+        # flight. Merging the entire baseline copy afterwards would undo it.
+        os.environ["HERMES_CRON_PAUSED"] = "true"
+        environ["HERMES_HOME"] = "poisoned-by-source"
+        environ["UNLOCKED_SOURCE_PROBE"] = "applied"
+        return SimpleNamespace(sources=[], applied_any=False, conflicts=[])
+
+    monkeypatch.setattr(registry, "apply_all", fake_apply_all)
+
+    env_loader._apply_external_secret_sources(home)
+
+    assert os.environ["HERMES_HOME"] == str(home)
+    assert os.environ["HERMES_CRON_PAUSED"] == "true"
+    assert os.environ["UNLOCKED_SOURCE_PROBE"] == "applied"
+    monkeypatch.setenv("HERMES_CRON_PAUSED", "false")
+    from cron.jobs import is_cron_dispatch_paused
+
+    assert is_cron_dispatch_paused() is True
+
+
+def test_cron_pause_latches_across_later_profile_false_reload(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.env_loader as env_loader
+    from cron.jobs import is_cron_dispatch_paused
+
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    primary.mkdir()
+    secondary.mkdir()
+    (primary / ".env").write_text(
+        "HERMES_CRON_PAUSED=true\n", encoding="utf-8"
+    )
+    (secondary / ".env").write_text(
+        "HERMES_CRON_PAUSED=false\n", encoding="utf-8"
+    )
+    monkeypatch.delenv("HERMES_CRON_PAUSED", raising=False)
+    monkeypatch.setattr(env_loader, "_apply_managed_env", lambda: None)
+
+    env_loader.load_hermes_dotenv(
+        hermes_home=primary, load_external_secrets=False
+    )
+    assert is_cron_dispatch_paused() is True
+
+    env_loader.load_hermes_dotenv(
+        hermes_home=secondary, load_external_secrets=False
+    )
+    assert os.environ["HERMES_CRON_PAUSED"] == "false"
+    assert is_cron_dispatch_paused() is True
+
+
+def test_inherited_cron_pause_latches_before_dotenv_false_override(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.env_loader as env_loader
+    from cron.jobs import is_cron_dispatch_paused
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text(
+        "HERMES_CRON_PAUSED=false\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_CRON_PAUSED", "true")
+    monkeypatch.setattr(env_loader, "_apply_managed_env", lambda: None)
+
+    env_loader.load_hermes_dotenv(
+        hermes_home=home, load_external_secrets=False
+    )
+
+    assert os.environ["HERMES_CRON_PAUSED"] == "false"
+    assert is_cron_dispatch_paused() is True
+
+
+def test_dotenv_cannot_activate_gateway_launch_lock_after_start(
+    tmp_path, monkeypatch
+):
+    """Only the marker present before the first load can activate the lock."""
+    env_loader = _reset_gateway_launch_env_lock(monkeypatch)
+    home = tmp_path / "runtime-home"
+    reviewed_cwd = tmp_path / "reviewed-repo"
+    venv = tmp_path / "venv"
+    home.mkdir()
+    reviewed_cwd.mkdir()
+    venv.mkdir()
+    monkeypatch.chdir(reviewed_cwd)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    attacker_values = {
+        "HERMES_HOME": str(home),
+        "HERMES_RUNTIME_HOME": str(home),
+        "GLADLY_HERMES_CODE_ROOT": str(reviewed_cwd),
+        "PYTHONPATH": "attacker-pythonpath",
+        "VIRTUAL_ENV": "attacker-venv",
+    }
+    injected_marker = env_loader._encode_gateway_launch_env_lock(
+        attacker_values, reviewed_cwd
+    )
+    (home / ".env").write_text(
+        "\n".join(
+            [
+                *(f"{key}={value}" for key, value in attacker_values.items()),
+                f"{env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR}={injected_marker}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(env_loader, "_apply_managed_env", lambda: None)
+    monkeypatch.setattr(
+        env_loader, "_reapply_terminal_config_bridge", lambda _home: None
+    )
+
+    env_loader.load_hermes_dotenv(load_external_secrets=False)
+    assert env_loader._GATEWAY_LAUNCH_ENV_STATE is None
+    assert env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR not in os.environ
+    assert os.environ["VIRTUAL_ENV"] == "attacker-venv"
+
+    # A second reload still cannot capture the marker that came from .env.
+    env_loader.load_hermes_dotenv(hermes_home=home, load_external_secrets=False)
+    assert env_loader._GATEWAY_LAUNCH_ENV_STATE is None
+    assert env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR not in os.environ
+
+
+def test_invalid_gateway_launch_env_lock_fails_closed(tmp_path, monkeypatch):
+    env_loader = _reset_gateway_launch_env_lock(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR, "not-base64")
+
+    with pytest.raises(RuntimeError, match="Refusing detached gateway startup"):
+        env_loader.load_hermes_dotenv(
+            hermes_home=tmp_path,
+            load_external_secrets=False,
+        )
+
+
+def test_gateway_launch_env_lock_rejects_wrong_initial_cwd(tmp_path, monkeypatch):
+    env_loader = _reset_gateway_launch_env_lock(monkeypatch)
+    actual_cwd = tmp_path / "actual"
+    expected_cwd = tmp_path / "expected"
+    home = tmp_path / "home"
+    venv = tmp_path / "venv"
+    for path in (actual_cwd, expected_cwd, home, venv):
+        path.mkdir()
+    monkeypatch.chdir(actual_cwd)
+    locked = {
+        "HERMES_HOME": str(home),
+        "HERMES_RUNTIME_HOME": str(home),
+        "GLADLY_HERMES_CODE_ROOT": str(expected_cwd),
+        "PYTHONPATH": str(expected_cwd),
+        "VIRTUAL_ENV": str(venv),
+    }
+    monkeypatch.setenv(
+        env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR,
+        env_loader._encode_gateway_launch_env_lock(locked, expected_cwd),
+    )
+
+    with pytest.raises(RuntimeError, match="Refusing detached gateway startup"):
+        env_loader.load_hermes_dotenv(
+            hermes_home=home,
+            load_external_secrets=False,
+        )
+
+
+def test_gateway_launch_env_lock_rejects_public_env_mismatch(
+    tmp_path, monkeypatch
+):
+    env_loader = _reset_gateway_launch_env_lock(monkeypatch)
+    reviewed_cwd = tmp_path / "reviewed"
+    home = tmp_path / "home"
+    venv = tmp_path / "venv"
+    for path in (reviewed_cwd, home, venv):
+        path.mkdir()
+    monkeypatch.chdir(reviewed_cwd)
+    locked = {
+        "HERMES_HOME": str(home),
+        "HERMES_RUNTIME_HOME": str(home),
+        "GLADLY_HERMES_CODE_ROOT": str(reviewed_cwd),
+        "PYTHONPATH": str(Path(env_loader.__file__).resolve().parent.parent),
+        "VIRTUAL_ENV": str(venv),
+    }
+    for key, value in locked.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("HERMES_RUNTIME_HOME", str(tmp_path / "stale-runtime"))
+    monkeypatch.setenv(
+        env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR,
+        env_loader._encode_gateway_launch_env_lock(locked, reviewed_cwd),
+    )
+
+    with pytest.raises(RuntimeError, match="Refusing detached gateway startup"):
+        env_loader.load_hermes_dotenv(
+            hermes_home=home,
+            load_external_secrets=False,
+        )
 
 
 # ---------------------------------------------------------------------------

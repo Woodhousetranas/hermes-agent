@@ -117,6 +117,37 @@ _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
+# Migration/runtime quarantine.  Empty and explicit false spellings leave cron
+# enabled; every other non-empty value pauses dispatch.  Treating unknown
+# spellings as paused is intentional: a typo in a safety switch must fail
+# closed, not silently re-enable scheduled effects.
+_CRON_PAUSE_FALSE_VALUES = frozenset({"", "0", "false", "no", "off"})
+_CRON_DISPATCH_PAUSE_LATCH = threading.Event()
+
+
+def is_cron_dispatch_paused() -> bool:
+    """Return whether all cron dispatch is quarantined for this process.
+
+    Engagement is monotonic for the life of the process.  A later profile,
+    managed scope, or secret-source reload may overwrite the public env value
+    but cannot silently unpause another profile's scheduler.  A service
+    restart is the supported way to change the state in production.
+    """
+    if _CRON_DISPATCH_PAUSE_LATCH.is_set():
+        return True
+    value = os.getenv("HERMES_CRON_PAUSED", "")
+    if value.strip().casefold() not in _CRON_PAUSE_FALSE_VALUES:
+        _CRON_DISPATCH_PAUSE_LATCH.set()
+        return True
+    # Close the thread race where another caller engaged the latch after the
+    # first check but before this caller read the false-valued public env.
+    return _CRON_DISPATCH_PAUSE_LATCH.is_set()
+
+
+def _reset_cron_dispatch_pause_latch_for_tests() -> None:
+    """Reset the process latch; test-only restart simulation."""
+    _CRON_DISPATCH_PAUSE_LATCH.clear()
+
 
 @dataclass(frozen=True)
 class _CronStorePaths:
@@ -2750,7 +2781,7 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     return False
 
 
-def clear_run_claim(job_id: str) -> bool:
+def clear_run_claim(job_id: str, *, expected_owner: Optional[str] = None) -> bool:
     """Clear a one-shot job's ``run_claim`` when its dispatch fails.
 
     ``get_due_jobs`` stamps a ``run_claim`` before returning a one-shot as
@@ -2770,7 +2801,12 @@ def clear_run_claim(job_id: str) -> bool:
                 continue
             if job.get("schedule", {}).get("kind") != "once":
                 return False
-            if job.get("run_claim") is not None:
+            claim = job.get("run_claim")
+            if expected_owner is not None and (
+                not isinstance(claim, dict) or claim.get("by") != expected_owner
+            ):
+                return False
+            if claim is not None:
                 job["run_claim"] = None
                 save_jobs(jobs)
                 return True
@@ -2794,9 +2830,13 @@ def advance_next_runs(job_ids) -> int:
     and identical to the per-job form once the batch completes.
     """
     ids = set(job_ids)
-    if not ids:
+    if not ids or is_cron_dispatch_paused():
         return 0
     with _jobs_lock():
+        # Re-check after waiting for the store lock.  A migration quarantine
+        # engaged while this thread was blocked must not consume due times.
+        if is_cron_dispatch_paused():
+            return 0
         jobs = load_jobs()
         now = _hermes_now().isoformat()
         advanced = 0
@@ -2856,8 +2896,18 @@ def claim_job_for_fire(
     force: bool = False,
     return_job: bool = False,
 ) -> Union[bool, Dict[str, Any]]:
+    # Global quarantine always wins, including explicit/manual ``force``.
+    # Check before entering the per-job fence so a paused claim cannot mutate
+    # jobs.json, advance next_run_at, or stamp a fire owner.
+    if is_cron_dispatch_paused():
+        return False
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
+            return False
+        # The pause may engage while this caller waits for another owner to
+        # leave the per-job fence.  Re-check while holding the exact fence that
+        # serializes claim mutation; ``force`` never bypasses this gate.
+        if is_cron_dispatch_paused():
             return False
         return _claim_job_for_fire_locked(
             job_id,
@@ -2898,6 +2948,11 @@ def _claim_job_for_fire_locked(
     reclaim it.
     """
     with _jobs_lock():
+        # Final pre-mutation check after both the fire fence and jobs lock are
+        # held.  This closes the deterministic wait-window where a reload can
+        # engage quarantine after the public wrapper's first check.
+        if is_cron_dispatch_paused():
+            return False
         jobs = load_jobs()
         for job in jobs:
             if job["id"] != job_id:
@@ -2924,6 +2979,21 @@ def _claim_job_for_fire_locked(
                         return False  # someone holds a fresh claim
                 except Exception:
                     pass  # malformed claim → overwrite
+            restore_fields = (
+                "fire_claim",
+                "enabled",
+                "state",
+                "paused_at",
+                "paused_reason",
+                "next_run_at",
+            )
+            before_claim = {
+                field: {
+                    "present": field in job,
+                    "value": copy.deepcopy(job.get(field)),
+                }
+                for field in restore_fields
+            }
             if force:
                 job["enabled"] = True
                 job["state"] = "scheduled"
@@ -2939,9 +3009,92 @@ def _claim_job_for_fire_locked(
                 nxt = compute_next_run(job["schedule"], now.isoformat())
                 if nxt:
                     job["next_run_at"] = nxt
+            after_claim = {
+                field: {
+                    "present": field in job,
+                    "value": copy.deepcopy(job.get(field)),
+                }
+                for field in restore_fields
+            }
             save_jobs(jobs)
-            return copy.deepcopy(job) if return_job else True
+            if not return_job:
+                return True
+            claimed_job = copy.deepcopy(job)
+            # Process-local rollback metadata is deliberately NOT persisted in
+            # jobs.json.  It lets the claimed→execute boundary undo only the
+            # exact fields this claim changed if quarantine engages in that
+            # narrow window, without clobbering a concurrent operator edit.
+            claimed_job["_fire_claim_restore"] = {
+                "before": before_claim,
+                "claimed": after_claim,
+            }
+            return claimed_job
         return False
+
+
+def release_fire_claim(
+    job_id: str,
+    *,
+    expected_owner: str,
+    restore_snapshot: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Release an unstarted fire claim owned by ``expected_owner``.
+
+    When ``restore_snapshot`` is the private snapshot returned by
+    :func:`claim_job_for_fire`, claim-time schedule/resume mutations are
+    rolled back only if every protected field still has the exact claimed
+    value.  Any concurrent edit makes restoration fail closed (the claim is
+    still released, but newer state is never overwritten).
+    """
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return False
+        with _jobs_lock():
+            jobs = load_jobs()
+            for job in jobs:
+                if job.get("id") != job_id:
+                    continue
+                claim = job.get("fire_claim")
+                if not isinstance(claim, dict) or claim.get("by") != expected_owner:
+                    return False
+
+                before = (
+                    restore_snapshot.get("before")
+                    if isinstance(restore_snapshot, dict)
+                    else None
+                )
+                claimed = (
+                    restore_snapshot.get("claimed")
+                    if isinstance(restore_snapshot, dict)
+                    else None
+                )
+                restorable = False
+                if isinstance(before, dict) and isinstance(claimed, dict):
+                    restorable = True
+                    for field, expected in claimed.items():
+                        if not isinstance(expected, dict):
+                            restorable = False
+                            break
+                        present = field in job
+                        if present != bool(expected.get("present")) or (
+                            present and job.get(field) != expected.get("value")
+                        ):
+                            restorable = False
+                            break
+                    if restorable:
+                        for field, prior in before.items():
+                            if not isinstance(prior, dict):
+                                continue
+                            if prior.get("present"):
+                                job[field] = copy.deepcopy(prior.get("value"))
+                            else:
+                                job.pop(field, None)
+
+                if not restorable:
+                    job["fire_claim"] = None
+                save_jobs(jobs)
+                return True
+    return False
 
 
 # Completed one-shot job records are retained in jobs.json (final status +
@@ -3077,12 +3230,20 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     Note: firing once on catch-up flows through ``mark_job_run``, so a job with
     a ``repeat.times`` limit consumes one of its runs on that catch-up fire.
     """
+    if is_cron_dispatch_paused():
+        return []
     with _jobs_lock():
+        # A reload may engage quarantine while this thread waits for the
+        # profile store.  Do not enter the repairing/mutating due scan then.
+        if is_cron_dispatch_paused():
+            return []
         return _get_due_jobs_locked()
 
 
 def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     """Inner implementation of get_due_jobs(); must be called with _jobs_lock held."""
+    if is_cron_dispatch_paused():
+        return []
     now = _hermes_now()
     raw_jobs = load_jobs()
     needs_save = False
@@ -3412,19 +3573,12 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                             grace,
                             new_next,
                         )
-                        # Persist the fast-forward to storage now (skip accumulated
-                        # slots). In the built-in ticker path this is shortly
-                        # overwritten by advance_next_run + mark_job_run, but it is
-                        # NOT redundant: it (a) protects the crash window between
-                        # here and mark_job_run, and (b) covers the external
-                        # fire_due provider path, which does not call
-                        # advance_next_run. mark_job_run re-anchors next_run_at off
-                        # the actual completion time, so this value is provisional.
-                        for rj in raw_jobs:
-                            if rj["id"] == job["id"]:
-                                rj["next_run_at"] = new_next
-                                needs_save = True
-                                break
+                        # Do not persist this provisional fast-forward during
+                        # the due scan. ``claim_job_for_fire`` is the single
+                        # owner-fenced pre-execution schedule mutation for both
+                        # built-in and external-provider fires. Persisting here
+                        # consumes the catch-up occurrence if migration pause
+                        # engages after the scan but before that claim.
                         record_catch_up_occurrence()
                         # Fall through to due.append(job) — execute once now
 
@@ -3510,6 +3664,13 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 job.get("name") or job.get("id") or "?",
             )
             continue
+
+    # The scan repairs stale schedules and stamps one-shot run claims in a
+    # private in-memory copy.  If quarantine engaged anywhere during that
+    # work, discard the copy wholesale: persisting its fast-forwards would
+    # consume occurrences even though tick correctly refuses dispatch.
+    if is_cron_dispatch_paused():
+        return []
 
     if needs_save:
         save_jobs(raw_jobs, removed_ids=intentionally_removed or None)

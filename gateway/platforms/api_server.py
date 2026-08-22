@@ -5944,6 +5944,18 @@ class APIServerAdapter(BasePlatformAdapter):
             if not job_id:
                 return web.json_response({"error": "missing job_id"}, status=400)
 
+            from cron.jobs import is_cron_dispatch_paused
+
+            if is_cron_dispatch_paused():
+                return web.json_response(
+                    {
+                        "error": "cron dispatch is paused",
+                        "job_id": job_id,
+                    },
+                    status=503,
+                    headers={"Retry-After": "1"},
+                )
+
             from cron.scheduler_provider import (
                 provider_supports_split_fire,
                 resolve_cron_scheduler,
@@ -5974,6 +5986,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 # ``fire_due`` hook (custom claim/re-arm/telemetry) but
                 # inherits the base ``claim_fire`` — driving it through the
                 # split claim path would silently bypass that override.
+                # The legacy hook has no durable claim/rollback contract, so
+                # establish an explicit admission point on a worker thread
+                # before acknowledging the callback. A pause before this
+                # point is retryable; a pause after it treats the fire as
+                # already in flight and must not silently drop a 202-acked
+                # callback.
+                if await asyncio.to_thread(is_cron_dispatch_paused):
+                    return web.json_response(
+                        {
+                            "error": "cron dispatch is paused",
+                            "job_id": job_id,
+                        },
+                        status=503,
+                        headers={"Retry-After": "1"},
+                    )
+
                 task = asyncio.create_task(
                     asyncio.to_thread(
                         provider.fire_due,
@@ -6006,6 +6034,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=503,
                 )
             if claimed_job is None:
+                if is_cron_dispatch_paused():
+                    return web.json_response(
+                        {
+                            "error": "cron dispatch is paused",
+                            "job_id": job_id,
+                        },
+                        status=503,
+                        headers={"Retry-After": "1"},
+                    )
                 return web.json_response(
                     {"status": "duplicate", "job_id": job_id},
                     status=200,
