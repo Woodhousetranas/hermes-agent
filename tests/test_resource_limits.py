@@ -367,7 +367,16 @@ def test_named_profile_reroute_defers_limit_to_final_process(monkeypatch, tmp_pa
         exec_call.update(executable=executable, argv=argv, env=env)
         raise _ExecCalled
 
+    class _PendingWindowsExec:
+        def wait(self):
+            raise _ExecCalled
+
+    def stop_at_windows_spawn(argv, *, env):
+        exec_call.update(executable=argv[0], argv=argv, env=env)
+        return _PendingWindowsExec()
+
     monkeypatch.setattr(cli_main.os, "execvpe", stop_at_exec)
+    monkeypatch.setattr(cli_main.subprocess, "Popen", stop_at_windows_spawn)
 
     args = SimpleNamespace(
         status=False,
