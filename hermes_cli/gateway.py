@@ -1074,6 +1074,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
     if sys.platform == "win32":
         try:
             from hermes_cli.gateway_windows import (
+                _managed_gateway_child_environment,
                 windowless_gateway_restart_spec,
             )
 
@@ -1090,8 +1091,20 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
                 "VIRTUAL_ENV",
                 _GATEWAY_LAUNCH_ENV_LOCK_VAR,
             }
+            if "HERMES_GATEWAY_RUNTIME_PATH" in os.environ:
+                required.update({"HERMES_GATEWAY_RUNTIME_PATH", "PATH"})
             if not respawn_cwd or not required.issubset(respawn_env_overlay):
                 raise RuntimeError("Windows gateway respawn spec is incomplete")
+            if "HERMES_GATEWAY_RUNTIME_PATH" in required and (
+                respawn_env_overlay["PATH"]
+                != respawn_env_overlay["HERMES_GATEWAY_RUNTIME_PATH"]
+            ):
+                raise RuntimeError("Windows gateway respawn PATH is not sealed")
+            respawn_env_is_allowlist = "HERMES_GATEWAY_RUNTIME_PATH" in required
+            if respawn_env_is_allowlist:
+                respawn_env_overlay = _managed_gateway_child_environment(
+                    respawn_env_overlay
+                )
         except Exception as exc:
             # The original gateway has already consumed its private launch
             # marker. Respawning with the inherited watcher environment would
@@ -1104,6 +1117,12 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
     # inner respawn can apply cwd= / env= without extra argv plumbing.
     respawn_cwd_literal = json.dumps(respawn_cwd)
     respawn_env_literal = json.dumps(respawn_env_overlay)
+    respawn_env_is_allowlist_literal = json.dumps(
+        bool(
+            sys.platform == "win32"
+            and "HERMES_GATEWAY_RUNTIME_PATH" in respawn_env_overlay
+        )
+    )
 
     watcher = textwrap.dedent(
         """
@@ -1120,6 +1139,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
         cmd = sys.argv[2:]
         _respawn_cwd = {respawn_cwd_literal}
         _respawn_env_overlay = {respawn_env_literal}
+        _respawn_env_is_allowlist = {respawn_env_is_allowlist_literal}
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             # ``os.kill(pid, 0)`` is not a no-op on Windows — use the
@@ -1147,7 +1167,10 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
         if _respawn_cwd:
             _popen_kwargs["cwd"] = _respawn_cwd
         if _respawn_env_overlay:
-            _popen_kwargs["env"] = {{**os.environ, **_respawn_env_overlay}}
+            if _respawn_env_is_allowlist:
+                _popen_kwargs["env"] = dict(_respawn_env_overlay)
+            else:
+                _popen_kwargs["env"] = {{**os.environ, **_respawn_env_overlay}}
         if sys.platform == "win32":
             try:
                 _popen_kwargs["creationflags"] = windows_detach_flags()
@@ -1167,6 +1190,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
     ).strip().format(
         respawn_cwd_literal=respawn_cwd_literal,
         respawn_env_literal=respawn_env_literal,
+        respawn_env_is_allowlist_literal=respawn_env_is_allowlist_literal,
     )
 
     watcher_argv = [
@@ -1184,17 +1208,20 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
         # ``-c`` otherwise puts the caller's cwd first on sys.path and an
         # inherited PYTHONPATH can shadow reviewed modules before the inner
         # launch spec is ever used.
-        watcher_env = dict(os.environ)
-        for key in (
-            "HERMES_HOME",
-            "HERMES_RUNTIME_HOME",
-            "GLADLY_HERMES_CODE_ROOT",
-            "PYTHONPATH",
-            "VIRTUAL_ENV",
-            "HERMES_GATEWAY_WORKING_DIR",
-        ):
-            watcher_env.pop(key, None)
-        watcher_env.update(respawn_env_overlay)
+        if "HERMES_GATEWAY_RUNTIME_PATH" in respawn_env_overlay:
+            watcher_env = dict(respawn_env_overlay)
+        else:
+            watcher_env = dict(os.environ)
+            for key in (
+                "HERMES_HOME",
+                "HERMES_RUNTIME_HOME",
+                "GLADLY_HERMES_CODE_ROOT",
+                "PYTHONPATH",
+                "VIRTUAL_ENV",
+                "HERMES_GATEWAY_WORKING_DIR",
+            ):
+                watcher_env.pop(key, None)
+            watcher_env.update(respawn_env_overlay)
         watcher_runtime_kwargs = {
             "cwd": respawn_cwd,
             "env": watcher_env,
@@ -5756,6 +5783,13 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         force: Skip the supervised-gateway conflict guard and start even when a
                systemd/launchd service is already supervising this profile.
     """
+    from hermes_cli.env_loader import _assert_gateway_start_provenance_if_managed
+
+    # Managed Windows runtimes may only reach the serving/ticker path through
+    # a v3-locked launcher whose start-near validator already proved current
+    # receipt, manifest, and Scheduled Task evidence. A raw ``gateway run``
+    # with copied public variables is not an equivalent launch path.
+    _assert_gateway_start_provenance_if_managed()
     _guard_official_docker_root_gateway()
     _guard_named_profile_under_multiplexer(force=force)
     _guard_supervised_gateway_conflict(force=force)

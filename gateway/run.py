@@ -1941,7 +1941,10 @@ _hermes_home = get_hermes_home()
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
 from dotenv import load_dotenv  # noqa: F401  # backward-compat for tests that monkeypatch this symbol
-from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.env_loader import (
+    _assert_gateway_start_provenance_if_managed,
+    load_hermes_dotenv,
+)
 _env_path = _hermes_home / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
 
@@ -11942,6 +11945,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         Returns True if at least one adapter connected successfully.
         """
+        _assert_gateway_start_provenance_if_managed()
+
         logger.info("Starting Hermes Gateway...")
         # Enable faulthandler for stack dumps on freezes/crashes (#70344).
         # Falls back to a log file when sys.stderr is None (Windows VBS /
@@ -29777,6 +29782,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    from hermes_cli.env_loader import _assert_gateway_start_provenance_if_managed
+
+    # This is the lowest shared serving boundary.  Every supported caller,
+    # including the legacy ``cli.py --gateway`` path, must prove the managed
+    # launch contract before changing process state or initializing anything.
+    _assert_gateway_start_provenance_if_managed()
+
     # Enable interactive exec approval for dangerous commands on messaging
     # platforms. Set here (not at module import) so incidental imports of
     # gateway.run from CLI/tool code do not poison HERMES_EXEC_ASK.
@@ -30464,6 +30476,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
 def main():
     """CLI entry point for the gateway."""
+    from hermes_cli.env_loader import _assert_gateway_start_provenance_if_managed
+
+    # Keep the dedicated ``python -m gateway.run`` entrypoint under the same
+    # managed launch contract as ``hermes gateway run``. This executes before
+    # config parsing, adapter connection, cron, or ticker startup.
+    _assert_gateway_start_provenance_if_managed()
+
     # Advertise the agent harness to child processes (AI_AGENT is the
     # cross-agent standard; HERMES_AGENT the Hermes-specific marker — see
     # _advertise_agent_env in hermes_cli/main.py, kept inline here to avoid

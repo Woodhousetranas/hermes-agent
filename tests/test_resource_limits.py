@@ -177,8 +177,15 @@ def test_never_lowers_an_unlimited_soft_limit(monkeypatch):
 async def test_gateway_startup_applies_limit_before_gateway_initialization(monkeypatch):
     import gateway.code_skew
     import gateway.run as gateway_run
+    import hermes_cli.env_loader
 
     calls: list[str] = []
+
+    monkeypatch.setattr(
+        hermes_cli.env_loader,
+        "_assert_gateway_start_provenance_if_managed",
+        lambda: calls.append("provenance"),
+    )
 
     monkeypatch.setattr(
         resource_limits,
@@ -198,7 +205,78 @@ async def test_gateway_startup_applies_limit_before_gateway_initialization(monke
     with pytest.raises(_StopStartup):
         await gateway_run.start_gateway()
 
-    assert calls == ["limit", "gateway-init"]
+    assert calls == ["provenance", "limit", "gateway-init"]
+
+
+@pytest.mark.anyio
+async def test_gateway_startup_rejects_before_process_or_runtime_initialization(monkeypatch):
+    import gateway.code_skew
+    import gateway.run as gateway_run
+    import hermes_cli.env_loader
+
+    calls: list[str] = []
+    monkeypatch.setenv("HERMES_EXEC_ASK", "unchanged-before-provenance")
+
+    class _ManagedStartRejected(RuntimeError):
+        pass
+
+    def reject_unproven_start():
+        calls.append("provenance")
+        raise _ManagedStartRejected("managed launch provenance is missing")
+
+    monkeypatch.setattr(
+        hermes_cli.env_loader,
+        "_assert_gateway_start_provenance_if_managed",
+        reject_unproven_start,
+    )
+    monkeypatch.setattr(
+        resource_limits,
+        "apply_nofile_soft_limit",
+        lambda: calls.append("limit"),
+    )
+    monkeypatch.setattr(
+        gateway.code_skew,
+        "record_boot_fingerprint",
+        lambda: calls.append("gateway-init"),
+    )
+
+    with pytest.raises(_ManagedStartRejected, match="managed launch provenance is missing"):
+        await gateway_run.start_gateway()
+
+    assert calls == ["provenance"]
+    assert gateway_run.os.environ["HERMES_EXEC_ASK"] == "unchanged-before-provenance"
+
+
+@pytest.mark.anyio
+async def test_gateway_runner_start_rejects_as_its_first_operation(monkeypatch):
+    import gateway.run as gateway_run
+
+    calls: list[str] = []
+
+    class _ManagedStartRejected(RuntimeError):
+        pass
+
+    def reject_unproven_start():
+        calls.append("provenance")
+        raise _ManagedStartRejected("direct runner provenance is missing")
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_assert_gateway_start_provenance_if_managed",
+        reject_unproven_start,
+    )
+    monkeypatch.setattr(gateway_run.logger, "info", lambda *_args: calls.append("log"))
+    monkeypatch.setattr(
+        gateway_run.faulthandler,
+        "enable",
+        lambda *_args, **_kwargs: calls.append("faulthandler"),
+    )
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    with pytest.raises(_ManagedStartRejected, match="direct runner provenance is missing"):
+        await runner.start()
+
+    assert calls == ["provenance"]
 
 
 def test_serve_startup_applies_limit_before_web_server(monkeypatch):
