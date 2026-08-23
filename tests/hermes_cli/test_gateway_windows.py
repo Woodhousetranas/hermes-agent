@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -1315,6 +1316,126 @@ def test_task_xml_complete_renderer_allows_only_direct_settings_enabled_overlay(
         not gateway_windows._task_xml_matches_current_definition(candidate)
         for candidate in hostile_variants
     )
+
+
+def test_task_xml_accepts_only_exact_windows_scheduler_export_normalization(
+    monkeypatch,
+):
+    from copy import deepcopy
+    from xml.etree import ElementTree
+
+    for key in env_loader._GATEWAY_MANAGED_LAUNCH_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    task_name = gateway_windows.get_task_name()
+    user = r"DOMAIN\alice"
+    sid = "S-1-5-21-111-222-333-1001"
+    monkeypatch.setattr(gateway_windows, "_resolve_task_user", lambda: user)
+    monkeypatch.setattr(gateway_windows, "_resolve_task_user_sid", lambda: sid)
+    renderer_xml = gateway_windows._build_scheduled_task_xml(
+        task_name,
+        gateway_windows._expected_task_script_path().with_suffix(".vbs"),
+        user,
+        enabled=False,
+    )
+
+    namespace = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
+
+    def child(parent, name):
+        return next(node for node in list(parent) if node.tag == f"{namespace}{name}")
+
+    def exported_xml(source):
+        root = deepcopy(ElementTree.fromstring(source))
+        registration = child(root, "RegistrationInfo")
+        uri = ElementTree.Element(f"{namespace}URI")
+        uri.text = f"\\{task_name}"
+        registration.append(uri)
+        principal = child(child(root, "Principals"), "Principal")
+        child(principal, "UserId").text = sid
+        principal.remove(child(principal, "RunLevel"))
+        trigger = child(child(root, "Triggers"), "LogonTrigger")
+        trigger.remove(child(trigger, "Enabled"))
+        settings = child(root, "Settings")
+        for name in (
+            "AllowHardTerminate",
+            "RunOnlyIfNetworkAvailable",
+            "AllowStartOnDemand",
+            "Hidden",
+            "RunOnlyIfIdle",
+            "WakeToRun",
+            "Priority",
+        ):
+            settings.remove(child(settings, name))
+        restart = child(settings, "RestartOnFailure")
+        restart[:] = [child(restart, "Count"), child(restart, "Interval")]
+        unified = ElementTree.Element(f"{namespace}UseUnifiedSchedulingEngine")
+        unified.text = "true"
+        settings.append(unified)
+        setting_order = (
+            "DisallowStartIfOnBatteries",
+            "StopIfGoingOnBatteries",
+            "Enabled",
+            "ExecutionTimeLimit",
+            "MultipleInstancesPolicy",
+            "RestartOnFailure",
+            "StartWhenAvailable",
+            "IdleSettings",
+            "UseUnifiedSchedulingEngine",
+        )
+        settings_by_name = {
+            node.tag.rsplit("}", 1)[-1]: node for node in list(settings)
+        }
+        settings[:] = [settings_by_name[name] for name in setting_order]
+        root_order = (
+            "RegistrationInfo",
+            "Principals",
+            "Settings",
+            "Triggers",
+            "Actions",
+        )
+        root_by_name = {node.tag.rsplit("}", 1)[-1]: node for node in list(root)}
+        root[:] = [root_by_name[name] for name in root_order]
+        return ElementTree.tostring(root, encoding="unicode")
+
+    exported = exported_xml(renderer_xml)
+    assert gateway_windows._task_xml_matches_current_definition(exported)
+    assert not gateway_windows._task_xml_matches_current_definition(
+        exported,
+        allow_settings_enabled_overlay=False,
+    )
+    enabled_export = exported.replace(
+        "<ns0:Enabled>false</ns0:Enabled>",
+        "<ns0:Enabled>true</ns0:Enabled>",
+    )
+    assert gateway_windows._task_xml_matches_current_definition(enabled_export)
+    assert gateway_windows._task_xml_matches_current_definition(
+        enabled_export,
+        allow_settings_enabled_overlay=False,
+    )
+
+    hostile_variants = (
+        exported.replace(f"\\{task_name}", "\\Foreign_Gateway"),
+        exported.replace(sid, "S-1-5-21-111-222-333-1002"),
+        exported.replace(
+            "<ns0:UseUnifiedSchedulingEngine>true</ns0:UseUnifiedSchedulingEngine>",
+            "<ns0:UseUnifiedSchedulingEngine>false</ns0:UseUnifiedSchedulingEngine>",
+        ),
+        exported.replace("<ns0:Count>999</ns0:Count>", "<ns0:Count>998</ns0:Count>"),
+        exported.replace(
+            "</ns0:Settings>",
+            "<ns0:ForeignPolicy>true</ns0:ForeignPolicy></ns0:Settings>",
+        ),
+    )
+    assert all(
+        not gateway_windows._task_xml_matches_current_definition(candidate)
+        for candidate in hostile_variants
+    )
+
+
+@pytest.mark.windows_only
+def test_task_user_sid_is_read_from_current_windows_token():
+    sid = gateway_windows._resolve_task_user_sid()
+    assert sid is not None
+    assert re.fullmatch(r"S-\d+(?:-\d+)+", sid)
 
 
 def test_elevated_install_propagates_disabled_flag(monkeypatch):

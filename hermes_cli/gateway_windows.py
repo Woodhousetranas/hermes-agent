@@ -1326,6 +1326,97 @@ def _resolve_task_user() -> str | None:
     return f"{domain}\\{username}" if domain else username
 
 
+def _resolve_task_user_sid() -> str | None:
+    """Return the current process-token user's SID via trusted Windows APIs.
+
+    Task Scheduler accepts the ``DOMAIN\\user`` spelling written during task
+    registration, but exports that principal as its SID. Read the SID from the
+    current process token instead of resolving mutable environment text or
+    accepting an arbitrary SID found in exported XML.
+    """
+    if sys.platform != "win32":
+        return None
+
+    try:
+        from ctypes import wintypes
+
+        class _SID_AND_ATTRIBUTES(ctypes.Structure):
+            _fields_ = (
+                ("Sid", ctypes.c_void_p),
+                ("Attributes", wintypes.DWORD),
+            )
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+        kernel32.LocalFree.restype = wintypes.HLOCAL
+        advapi32.OpenProcessToken.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.HANDLE),
+        ]
+        advapi32.OpenProcessToken.restype = wintypes.BOOL
+        advapi32.GetTokenInformation.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        advapi32.GetTokenInformation.restype = wintypes.BOOL
+        advapi32.ConvertSidToStringSidW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.LPWSTR),
+        ]
+        advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+
+        token = wintypes.HANDLE()
+        token_query = 0x0008
+        if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(), token_query, ctypes.byref(token)
+        ):
+            return None
+        try:
+            required = wintypes.DWORD(0)
+            token_user = 1
+            advapi32.GetTokenInformation(
+                token, token_user, None, 0, ctypes.byref(required)
+            )
+            if not required.value:
+                return None
+            buffer = ctypes.create_string_buffer(required.value)
+            if not advapi32.GetTokenInformation(
+                token,
+                token_user,
+                buffer,
+                required.value,
+                ctypes.byref(required),
+            ):
+                return None
+            sid = ctypes.cast(
+                buffer, ctypes.POINTER(_SID_AND_ATTRIBUTES)
+            ).contents.Sid
+            if not sid:
+                return None
+            sid_text = wintypes.LPWSTR()
+            if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(sid_text)):
+                return None
+            try:
+                value = (sid_text.value or "").strip()
+                return value or None
+            finally:
+                if sid_text:
+                    kernel32.LocalFree(ctypes.cast(sid_text, wintypes.HLOCAL))
+        finally:
+            kernel32.CloseHandle(token)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
 def _build_scheduled_task_xml(
     task_name: str,
     launcher_path: Path,
@@ -2355,6 +2446,112 @@ def _task_xml_semantic_identity(element) -> tuple:
     )
 
 
+def _scheduler_export_root_for_current_definition(
+    renderer_root,
+    *,
+    task_name: str,
+    user_sid: str,
+):
+    """Return the one exact Windows Scheduler export of our renderer XML.
+
+    ``schtasks /Query /XML`` does not round-trip registration XML byte for
+    byte. On current Windows it injects the task URI, resolves the principal
+    to the current token SID, omits fixed schema defaults, enables the unified
+    scheduling engine, and emits sections/settings in a deterministic order.
+    Model only that complete known projection; foreign fields, principals,
+    values, omissions, and actions still fail closed.
+    """
+    from copy import deepcopy
+    from xml.etree import ElementTree
+
+    namespace = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
+
+    def direct_child(parent, name: str):
+        matches = [child for child in list(parent) if child.tag == f"{namespace}{name}"]
+        if len(matches) != 1:
+            raise ValueError(f"Expected exactly one Task Scheduler {name} element")
+        return matches[0]
+
+    export_root = deepcopy(renderer_root)
+    registration = direct_child(export_root, "RegistrationInfo")
+    uri = ElementTree.Element(f"{namespace}URI")
+    uri.text = f"\\{task_name}"
+    registration.append(uri)
+
+    principals = direct_child(export_root, "Principals")
+    principal = direct_child(principals, "Principal")
+    user_id = direct_child(principal, "UserId")
+    user_id.text = user_sid
+    run_level = direct_child(principal, "RunLevel")
+    if (run_level.text or "") != "LeastPrivilege":
+        raise ValueError("Unexpected task RunLevel renderer default")
+    principal.remove(run_level)
+
+    triggers = direct_child(export_root, "Triggers")
+    logon_trigger = direct_child(triggers, "LogonTrigger")
+    trigger_enabled = direct_child(logon_trigger, "Enabled")
+    if (trigger_enabled.text or "") != "true":
+        raise ValueError("Unexpected LogonTrigger Enabled renderer default")
+    logon_trigger.remove(trigger_enabled)
+
+    settings = direct_child(export_root, "Settings")
+    omitted_defaults = {
+        "AllowHardTerminate": "true",
+        "RunOnlyIfNetworkAvailable": "false",
+        "AllowStartOnDemand": "true",
+        "Hidden": "false",
+        "RunOnlyIfIdle": "false",
+        "WakeToRun": "false",
+        "Priority": "7",
+    }
+    for name, expected_value in omitted_defaults.items():
+        element = direct_child(settings, name)
+        if (element.text or "") != expected_value:
+            raise ValueError(f"Unexpected task {name} renderer default")
+        settings.remove(element)
+
+    restart = direct_child(settings, "RestartOnFailure")
+    restart_count = direct_child(restart, "Count")
+    restart_interval = direct_child(restart, "Interval")
+    restart[:] = [restart_count, restart_interval]
+
+    unified = ElementTree.Element(f"{namespace}UseUnifiedSchedulingEngine")
+    unified.text = "true"
+    settings.append(unified)
+    scheduler_setting_order = (
+        "DisallowStartIfOnBatteries",
+        "StopIfGoingOnBatteries",
+        "Enabled",
+        "ExecutionTimeLimit",
+        "MultipleInstancesPolicy",
+        "RestartOnFailure",
+        "StartWhenAvailable",
+        "IdleSettings",
+        "UseUnifiedSchedulingEngine",
+    )
+    settings_by_name = {
+        child.tag.rsplit("}", 1)[-1]: child for child in list(settings)
+    }
+    if set(settings_by_name) != set(scheduler_setting_order):
+        raise ValueError("Unexpected task Settings renderer shape")
+    settings[:] = [settings_by_name[name] for name in scheduler_setting_order]
+
+    scheduler_root_order = (
+        "RegistrationInfo",
+        "Principals",
+        "Settings",
+        "Triggers",
+        "Actions",
+    )
+    root_by_name = {
+        child.tag.rsplit("}", 1)[-1]: child for child in list(export_root)
+    }
+    if set(root_by_name) != set(scheduler_root_order):
+        raise ValueError("Unexpected task renderer root shape")
+    export_root[:] = [root_by_name[name] for name in scheduler_root_order]
+    return export_root
+
+
 def _task_xml_matches_current_definition(
     xml_text: str,
     *,
@@ -2362,11 +2559,10 @@ def _task_xml_matches_current_definition(
 ) -> bool:
     """Compare the complete task XML to the exact current renderer.
 
-    Task Scheduler may reformat XML, so comparison is semantic rather than
-    byte-based. Every element, attribute, text value, namespace, and child
-    order must match the renderer. The sole permitted runtime overlay is the
-    direct ``Task/Settings/Enabled`` value; trigger ``Enabled`` values and all
-    other policy/principal/action fields remain exact.
+    Comparison accepts either the direct renderer or the one exact projection
+    exported by Windows Task Scheduler. Every element, attribute, text value,
+    namespace, and child order must otherwise match. The sole mutable runtime
+    overlay is the direct ``Task/Settings/Enabled`` value.
     """
     try:
         from xml.etree import ElementTree
@@ -2400,9 +2596,18 @@ def _task_xml_matches_current_definition(
             enabled=expected_enabled,
         )
         expected_root = ElementTree.fromstring(expected_xml)
-        return _task_xml_semantic_identity(actual_root) == _task_xml_semantic_identity(
-            expected_root
+        actual_identity = _task_xml_semantic_identity(actual_root)
+        if actual_identity == _task_xml_semantic_identity(expected_root):
+            return True
+        user_sid = _resolve_task_user_sid()
+        if not user_sid:
+            return False
+        exported_root = _scheduler_export_root_for_current_definition(
+            expected_root,
+            task_name=get_task_name(),
+            user_sid=user_sid,
         )
+        return actual_identity == _task_xml_semantic_identity(exported_root)
     except (ElementTree.ParseError, OSError, RuntimeError, ValueError):
         return False
 
