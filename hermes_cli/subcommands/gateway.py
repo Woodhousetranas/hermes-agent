@@ -165,6 +165,15 @@ def build_gateway_parser(
     )
     gateway_install.add_argument("--force", action="store_true", help="Force reinstall")
     gateway_install.add_argument(
+        "--install-disabled",
+        dest="install_disabled",
+        action="store_true",
+        help=(
+            "Windows only: register the Scheduled Task disabled without "
+            "starting the gateway (for staged host migration)"
+        ),
+    )
+    gateway_install.add_argument(
         "--system",
         action="store_true",
         help="Install as a Linux system-level service (starts at boot)",

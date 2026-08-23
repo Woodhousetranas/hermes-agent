@@ -465,6 +465,7 @@ def _scan_gateway_pids(
     exclude_pids: set[int],
     all_profiles: bool = False,
     include_restart_managers: bool = False,
+    strict: bool = False,
 ) -> list[int]:
     """Best-effort process-table scan for gateway PIDs.
 
@@ -563,6 +564,10 @@ def _scan_gateway_pids(
                 # so the downstream parser below doesn't need to branch.
                 powershell = shutil.which("powershell") or shutil.which("pwsh")
                 if powershell is None:
+                    if strict:
+                        raise RuntimeError(
+                            "Windows gateway process scan has no WMIC/CIM provider"
+                        )
                     return []
                 ps_cmd = (
                     "Get-CimInstance Win32_Process | "
@@ -578,8 +583,16 @@ def _scan_gateway_pids(
                     errors="ignore",
                 )
                 if result is None:
+                    if strict:
+                        raise RuntimeError("Windows gateway CIM scan did not complete")
                     return []
-            if result.returncode != 0 or result.stdout is None:
+            if (
+                result.returncode != 0
+                or result.stdout is None
+                or (strict and not result.stdout.strip())
+            ):
+                if strict:
+                    raise RuntimeError("Windows gateway process scan failed")
                 return []
             current_cmd = ""
             for line in result.stdout.split("\n"):
@@ -660,7 +673,9 @@ def _scan_gateway_pids(
                         all_profiles or _matches_current_profile(command)
                     ):
                         _append_unique_pid(pids, pid, exclude_pids)
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if strict:
+            raise RuntimeError("Gateway process scan failed") from exc
         return []
 
     # Windows-specific: collapse venv launcher stubs.  A venv-built
@@ -711,7 +726,10 @@ def _filter_venv_launcher_stubs(pids: list[int]) -> list[int]:
 
 
 def find_gateway_pids(
-    exclude_pids: set | None = None, all_profiles: bool = False
+    exclude_pids: set | None = None,
+    all_profiles: bool = False,
+    *,
+    strict_scan: bool = False,
 ) -> list:
     """Find PIDs of running gateway processes.
 
@@ -723,6 +741,9 @@ def find_gateway_pids(
             needs this because a code update affects every profile.
             When ``False`` (default), only PIDs belonging to the current
             Hermes profile are returned.
+        strict_scan: Raise when the Windows process table cannot be inspected.
+            Update quarantine uses this fail-closed mode; status remains
+            best-effort for backward compatibility.
     """
     _exclude = set(exclude_pids or set())
     pids: list[int] = []
@@ -743,6 +764,7 @@ def find_gateway_pids(
         _exclude,
         all_profiles=all_profiles,
         include_restart_managers=include_restart_managers,
+        strict=strict_scan,
     ):
         _append_unique_pid(pids, pid, _exclude)
     return pids
@@ -750,6 +772,8 @@ def find_gateway_pids(
 
 def find_profile_gateway_processes(
     exclude_pids: set | None = None,
+    *,
+    strict: bool = False,
 ) -> list[ProfileGatewayProcess]:
     """Return running gateway PIDs mapped to Hermes profiles via PID files."""
     _exclude = set(exclude_pids or set())
@@ -757,14 +781,26 @@ def find_profile_gateway_processes(
     try:
         from gateway.status import get_running_pid
         from hermes_cli.profiles import list_profiles
-    except Exception:
+    except Exception as exc:
+        if strict:
+            raise RuntimeError("Could not load gateway profile discovery") from exc
         return processes
 
     seen: set[int] = set()
-    for profile in list_profiles():
+    try:
+        profiles = list_profiles()
+    except Exception as exc:
+        if strict:
+            raise RuntimeError("Could not enumerate Hermes profiles") from exc
+        return processes
+    for profile in profiles:
         try:
             pid = get_running_pid(profile.path / "gateway.pid", cleanup_stale=False)
-        except Exception:
+        except Exception as exc:
+            if strict:
+                raise RuntimeError(
+                    f"Could not inspect gateway PID state for profile {profile.name}"
+                ) from exc
             continue
         if pid is None or pid <= 0 or pid in _exclude or pid in seen:
             continue
@@ -776,9 +812,17 @@ def find_profile_gateway_processes(
 
 
 def _gateway_run_args_for_profile(profile: str) -> list[str]:
-    args = [get_python_path(), "-m", "hermes_cli.main"]
-    if profile != "default":
-        args.extend(["--profile", profile])
+    # Restart argv must preserve exact profile identity. A bare default argv
+    # follows the mutable active_profile file during main.py bootstrap, which
+    # is incompatible with the Windows launch-provenance lock and can also
+    # restart a different profile than the one that was drained.
+    args = [
+        get_python_path(),
+        "-m",
+        "hermes_cli.main",
+        "--profile",
+        profile,
+    ]
     args.extend(["gateway", "run", "--replace"])
     return args
 
@@ -820,6 +864,134 @@ def _capture_gateway_argv(pid: int) -> list[str] | None:
     except Exception:
         pass
     return argv
+
+
+def _capture_current_install_gateway_argv(pid: int) -> list[str] | None:
+    """Capture a restart argv only when the process provenance is ours.
+
+    The Windows update scan can see gateways from every Hermes checkout on
+    the host.  An unmapped process has no current-root PID file, so command
+    line shape alone is insufficient authority to stop and replay it.  Prove
+    the process uses this runtime root and reviewed cwd, then make its actual
+    HERMES_HOME profile explicit before returning the argv.  Any missing or
+    conflicting evidence is deliberately non-actionable.
+    """
+    argv = _capture_gateway_argv(pid)
+    if not argv:
+        return None
+
+    try:
+        import psutil  # type: ignore
+
+        process = psutil.Process(pid)
+        process_env = dict(process.environ() or {})
+        process_cwd = Path(process.cwd()).resolve()
+
+        raw_home_value = process_env.get("HERMES_HOME", "").strip()
+        if not raw_home_value:
+            return None
+        raw_home = Path(raw_home_value).expanduser()
+        if not raw_home.is_absolute():
+            return None
+        runtime_home = raw_home.resolve()
+        if not runtime_home.is_dir():
+            return None
+
+        runtime_overlay = process_env.get("HERMES_RUNTIME_HOME", "").strip()
+        if runtime_overlay and Path(runtime_overlay).expanduser().resolve() != runtime_home:
+            return None
+
+        current_home = Path(get_hermes_home()).expanduser()
+        current_root = (
+            current_home.parent.parent
+            if current_home.parent.name.casefold() == "profiles"
+            else current_home
+        ).resolve()
+        runtime_root = (
+            raw_home.parent.parent
+            if raw_home.parent.name.casefold() == "profiles"
+            else raw_home
+        ).resolve()
+        if runtime_root != current_root:
+            return None
+
+        from hermes_cli.gateway_windows import (
+            _explicit_gateway_profile,
+            _resolve_gateway_code_root,
+        )
+        from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+        reviewed_cwd = Path(
+            _resolve_gateway_code_root(PROJECT_ROOT, str(runtime_home))
+        ).resolve()
+        if process_cwd != reviewed_cwd:
+            return None
+
+        declared_code_root = process_env.get("GLADLY_HERMES_CODE_ROOT", "").strip()
+        if (
+            declared_code_root
+            and Path(declared_code_root).expanduser().resolve() != reviewed_cwd
+        ):
+            return None
+
+        project_root = Path(PROJECT_ROOT).resolve()
+        if reviewed_cwd != project_root:
+            pythonpath_entries = {
+                Path(entry).expanduser().resolve()
+                for entry in process_env.get("PYTHONPATH", "").split(os.pathsep)
+                if entry.strip() and Path(entry).expanduser().is_absolute()
+            }
+            if project_root not in pythonpath_entries:
+                return None
+
+        if runtime_home == runtime_root:
+            runtime_profile = "default"
+        elif raw_home.parent.name.casefold() == "profiles":
+            runtime_profile = normalize_profile_name(raw_home.name)
+            validate_profile_name(runtime_profile)
+            if (runtime_root / "profiles" / runtime_profile).resolve() != runtime_home:
+                return None
+        else:
+            return None
+
+        explicit_profile = _explicit_gateway_profile(argv[1:])
+        if explicit_profile is not None:
+            return argv if explicit_profile == runtime_profile else None
+
+        gateway_index = argv.index("gateway", 1)
+        pinned_argv = list(argv)
+        pinned_argv[gateway_index:gateway_index] = ["--profile", runtime_profile]
+        return pinned_argv
+    except Exception:
+        return None
+
+
+def _gateway_process_runtime_root(pid: int) -> Path | None:
+    """Return a gateway process's self-declared runtime root, if provable."""
+    try:
+        import psutil  # type: ignore
+
+        process_env = dict(psutil.Process(pid).environ() or {})
+        raw_home_value = process_env.get("HERMES_HOME", "").strip()
+        if not raw_home_value:
+            return None
+        raw_home = Path(raw_home_value).expanduser()
+        if not raw_home.is_absolute() or not raw_home.resolve().is_dir():
+            return None
+        runtime_overlay = process_env.get("HERMES_RUNTIME_HOME", "").strip()
+        if (
+            runtime_overlay
+            and Path(runtime_overlay).expanduser().resolve() != raw_home.resolve()
+        ):
+            return None
+        root = (
+            raw_home.parent.parent
+            if raw_home.parent.name.casefold() == "profiles"
+            else raw_home
+        )
+        return root.resolve()
+    except Exception:
+        return None
 
 
 def _prepare_profile_gateway_update_restart(profile: str, pid: int) -> str | None:
@@ -902,23 +1074,55 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
     if sys.platform == "win32":
         try:
             from hermes_cli.gateway_windows import (
+                _managed_gateway_child_environment,
                 windowless_gateway_restart_spec,
             )
 
             run_argv, respawn_cwd, respawn_env_overlay = (
                 windowless_gateway_restart_spec(list(run_argv))
             )
-        except Exception:
-            # Best-effort: if the rewrite fails for any reason, fall back to
-            # the original argv.  A visible window is worse than nothing, but
-            # a failed respawn is worse still — keep the gateway coming back.
-            respawn_cwd = ""
-            respawn_env_overlay = {}
+            from hermes_cli.env_loader import _GATEWAY_LAUNCH_ENV_LOCK_VAR
+
+            required = {
+                "HERMES_HOME",
+                "HERMES_RUNTIME_HOME",
+                "GLADLY_HERMES_CODE_ROOT",
+                "PYTHONPATH",
+                "VIRTUAL_ENV",
+                _GATEWAY_LAUNCH_ENV_LOCK_VAR,
+            }
+            if "HERMES_GATEWAY_RUNTIME_PATH" in os.environ:
+                required.update({"HERMES_GATEWAY_RUNTIME_PATH", "PATH"})
+            if not respawn_cwd or not required.issubset(respawn_env_overlay):
+                raise RuntimeError("Windows gateway respawn spec is incomplete")
+            if "HERMES_GATEWAY_RUNTIME_PATH" in required and (
+                respawn_env_overlay["PATH"]
+                != respawn_env_overlay["HERMES_GATEWAY_RUNTIME_PATH"]
+            ):
+                raise RuntimeError("Windows gateway respawn PATH is not sealed")
+            respawn_env_is_allowlist = "HERMES_GATEWAY_RUNTIME_PATH" in required
+            if respawn_env_is_allowlist:
+                respawn_env_overlay = _managed_gateway_child_environment(
+                    respawn_env_overlay
+                )
+        except Exception as exc:
+            # The original gateway has already consumed its private launch
+            # marker. Respawning with the inherited watcher environment would
+            # let the next dotenv load redirect runtime/code roots, so Windows
+            # update restart is deliberately fail-closed here.
+            logger.error("Refusing unlocked Windows gateway respawn: %s", exc)
+            return False
 
     # Serialized as JSON literals embedded in the watcher source so the
     # inner respawn can apply cwd= / env= without extra argv plumbing.
     respawn_cwd_literal = json.dumps(respawn_cwd)
     respawn_env_literal = json.dumps(respawn_env_overlay)
+    respawn_env_is_allowlist_literal = json.dumps(
+        bool(
+            sys.platform == "win32"
+            and "HERMES_GATEWAY_RUNTIME_PATH" in respawn_env_overlay
+        )
+    )
 
     watcher = textwrap.dedent(
         """
@@ -935,6 +1139,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
         cmd = sys.argv[2:]
         _respawn_cwd = {respawn_cwd_literal}
         _respawn_env_overlay = {respawn_env_literal}
+        _respawn_env_is_allowlist = {respawn_env_is_allowlist_literal}
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             # ``os.kill(pid, 0)`` is not a no-op on Windows — use the
@@ -962,7 +1167,10 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
         if _respawn_cwd:
             _popen_kwargs["cwd"] = _respawn_cwd
         if _respawn_env_overlay:
-            _popen_kwargs["env"] = {{**os.environ, **_respawn_env_overlay}}
+            if _respawn_env_is_allowlist:
+                _popen_kwargs["env"] = dict(_respawn_env_overlay)
+            else:
+                _popen_kwargs["env"] = {{**os.environ, **_respawn_env_overlay}}
         if sys.platform == "win32":
             try:
                 _popen_kwargs["creationflags"] = windows_detach_flags()
@@ -982,6 +1190,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
     ).strip().format(
         respawn_cwd_literal=respawn_cwd_literal,
         respawn_env_literal=respawn_env_literal,
+        respawn_env_is_allowlist_literal=respawn_env_is_allowlist_literal,
     )
 
     watcher_argv = [
@@ -992,6 +1201,32 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
         *run_argv,
     ]
 
+    watcher_runtime_kwargs: dict = {}
+    if sys.platform == "win32":
+        # The outer ``python -c`` watcher imports Hermes helpers before it can
+        # launch the already-locked inner gateway.  Pin this process too:
+        # ``-c`` otherwise puts the caller's cwd first on sys.path and an
+        # inherited PYTHONPATH can shadow reviewed modules before the inner
+        # launch spec is ever used.
+        if "HERMES_GATEWAY_RUNTIME_PATH" in respawn_env_overlay:
+            watcher_env = dict(respawn_env_overlay)
+        else:
+            watcher_env = dict(os.environ)
+            for key in (
+                "HERMES_HOME",
+                "HERMES_RUNTIME_HOME",
+                "GLADLY_HERMES_CODE_ROOT",
+                "PYTHONPATH",
+                "VIRTUAL_ENV",
+                "HERMES_GATEWAY_WORKING_DIR",
+            ):
+                watcher_env.pop(key, None)
+            watcher_env.update(respawn_env_overlay)
+        watcher_runtime_kwargs = {
+            "cwd": respawn_cwd,
+            "env": watcher_env,
+        }
+
     # Same platform-aware detach for the watcher process itself — so
     # closing the user's terminal doesn't kill the watcher.
     try:
@@ -999,6 +1234,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
             watcher_argv,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            **watcher_runtime_kwargs,
             **windows_detach_popen_kwargs(),
         )
     except OSError:
@@ -1017,6 +1253,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
                 watcher_argv,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                **watcher_runtime_kwargs,
                 **fallback_kwargs,
             )
         except OSError:
@@ -3261,19 +3498,20 @@ def _append_node_dir_for_service(
 
     PATH lookup remains the fallback rung for installs with no managed Node.
     """
-    from hermes_constants import iter_hermes_node_dirs
+    from hermes_constants import (
+        hermes_managed_node_tree_present,
+        iter_hermes_node_dirs,
+    )
 
-    managed_node_present = False
-    for directory in iter_hermes_node_dirs(hermes_root):
+    managed_node_present = hermes_managed_node_tree_present(hermes_root)
+    for directory in iter_hermes_node_dirs(hermes_root) if managed_node_present else ():
         entry = str(directory)
         try:
             present = directory.is_dir()
         except OSError:
             present = False
-        if present:
-            managed_node_present = True
-            if entry not in path_entries:
-                path_entries.append(entry)
+        if present and entry not in path_entries:
+            path_entries.append(entry)
 
     # Ambient PATH lookup is a fallback, not an additional rung. Once the
     # target Hermes home provides managed Node, consulting the invoker's PATH
@@ -5545,6 +5783,13 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         force: Skip the supervised-gateway conflict guard and start even when a
                systemd/launchd service is already supervising this profile.
     """
+    from hermes_cli.env_loader import _assert_gateway_start_provenance_if_managed
+
+    # Managed Windows runtimes may only reach the serving/ticker path through
+    # a v3-locked launcher whose start-near validator already proved current
+    # receipt, manifest, and Scheduled Task evidence. A raw ``gateway run``
+    # with copied public variables is not an equivalent launch path.
+    _assert_gateway_start_provenance_if_managed()
     _guard_official_docker_root_gateway()
     _guard_named_profile_under_multiplexer(force=force)
     _guard_supervised_gateway_conflict(force=force)
@@ -7515,6 +7760,10 @@ def _gateway_command_inner(args):
         force = getattr(args, "force", False)
         system = getattr(args, "system", False)
         run_as_user = getattr(args, "run_as_user", None)
+        install_disabled = getattr(args, "install_disabled", False)
+        if install_disabled and not is_windows():
+            print_error("--install-disabled is only supported on Windows.")
+            sys.exit(2)
         if is_termux():
             print("Gateway service installation is not supported on Termux.")
             print("Run manually: hermes gateway")
@@ -7569,6 +7818,7 @@ def _gateway_command_inner(args):
                 start_now=getattr(args, 'start_now', None),
                 start_on_login=getattr(args, 'start_on_login', None),
                 elevated_handoff=getattr(args, 'elevated_handoff', False),
+                install_disabled=install_disabled,
             )
         elif is_wsl():
             print("WSL detected but systemd is not running.")

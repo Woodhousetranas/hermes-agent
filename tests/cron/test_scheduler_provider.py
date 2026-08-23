@@ -18,7 +18,19 @@ drives it and stops promptly.
 """
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def reset_cron_pause_latch():
+    import cron.jobs as jobs
+
+    jobs._reset_cron_dispatch_pause_latch_for_tests()
+    yield
+    jobs._reset_cron_dispatch_pause_latch_for_tests()
 
 
 def _wait_until(predicate, timeout=10.0, interval=0.005):
@@ -188,6 +200,28 @@ def test_inprocess_provider_ticks_and_stops():
     assert not t.is_alive(), "provider did not exit after stop_event was set"
     assert len(calls) >= 1, "provider never called tick()"
     assert calls[0].get("sync") is False
+
+
+def test_gateway_dispatch_gate_combines_quarantine_and_drain(monkeypatch):
+    from gateway.run import _gateway_cron_can_dispatch
+
+    runner = SimpleNamespace(_draining=False, _external_drain_active=False)
+    monkeypatch.delenv("HERMES_CRON_PAUSED", raising=False)
+    assert _gateway_cron_can_dispatch(runner) is True
+
+    monkeypatch.setenv("HERMES_CRON_PAUSED", "1")
+    assert _gateway_cron_can_dispatch(runner) is False
+
+    monkeypatch.setenv("HERMES_CRON_PAUSED", "false")
+    assert _gateway_cron_can_dispatch(runner) is False
+
+    # A process restart (simulated by the test-only reset) may load a false
+    # value and return to the ordinary drain gate.
+    from cron.jobs import _reset_cron_dispatch_pause_latch_for_tests
+
+    _reset_cron_dispatch_pause_latch_for_tests()
+    runner._external_drain_active = True
+    assert _gateway_cron_can_dispatch(runner) is False
 
 
 # ── Phase 2: config key, discovery, resolver ─────────────────────────────────
@@ -422,6 +456,78 @@ def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):
     assert events == ["ledger", "claim", ("run", "exec-1")]
 
 
+def test_claim_fire_quarantine_prevents_ledger_and_force(monkeypatch):
+    import cron.executions as executions
+    import cron.jobs as jobs
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    monkeypatch.setenv("HERMES_CRON_PAUSED", "true")
+    ledger_calls = []
+    claim_calls = []
+    monkeypatch.setattr(
+        executions,
+        "create_execution",
+        lambda *args, **kwargs: ledger_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        jobs,
+        "claim_job_for_fire",
+        lambda *args, **kwargs: claim_calls.append((args, kwargs)),
+    )
+
+    assert InProcessCronScheduler().claim_fire("j1", force=True) is None
+    assert ledger_calls == []
+    assert claim_calls == []
+
+
+def test_pause_after_provider_claim_cancels_before_execution(monkeypatch):
+    import cron.executions as executions
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    monkeypatch.delenv("HERMES_CRON_PAUSED", raising=False)
+    events = []
+
+    def claim_then_pause(job_id, **kwargs):
+        monkeypatch.setenv("HERMES_CRON_PAUSED", "true")
+        return {
+            "id": job_id,
+            "fire_claim": {"by": "pause-owner", "at": "now"},
+        }
+
+    monkeypatch.setattr(jobs, "claim_job_for_fire", claim_then_pause)
+    monkeypatch.setattr(
+        executions,
+        "create_execution",
+        lambda job_id, source: {"id": "execution-paused"},
+    )
+    monkeypatch.setattr(
+        sched,
+        "release_fire_claim",
+        lambda *args, **kwargs: events.append(("release", args, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        sched,
+        "finish_execution",
+        lambda *args, **kwargs: events.append(("finish", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        sched,
+        "run_one_job",
+        lambda *args, **kwargs: events.append(("run", args, kwargs)),
+    )
+
+    provider = InProcessCronScheduler()
+    claimed = provider.claim_fire("j1")
+    assert claimed is not None
+    assert provider.fire_claimed(claimed) is True
+
+    assert [event[0] for event in events] == ["release", "finish"]
+    assert events[0][2]["expected_owner"] == "pause-owner"
+    assert events[1][1] == ("execution-paused",)
+
+
 def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
     import cron.jobs as jobs
     import cron.scheduler as sched
@@ -638,5 +744,3 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     # With 2 profiles and multiple iterations, we should have seen at least 2 calls.
     assert len(tick_count) >= len(profile_homes), \
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
-
-

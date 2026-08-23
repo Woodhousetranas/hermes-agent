@@ -25,6 +25,15 @@ from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
 
+@pytest.fixture(autouse=True)
+def reset_cron_pause_latch():
+    import cron.jobs as jobs
+
+    jobs._reset_cron_dispatch_pause_latch_for_tests()
+    yield
+    jobs._reset_cron_dispatch_pause_latch_for_tests()
+
+
 class TestSummarizeCronFailureForDelivery:
     def test_embedded_429_in_source_identifier_is_not_a_rate_limit(self):
         summary = _summarize_cron_failure_for_delivery(
@@ -667,6 +676,127 @@ class TestRunJobSessionPersistence:
             assert tick(verbose=False, sync=True, can_dispatch=lambda: False) == 0
 
         claim.assert_not_called()
+        run_one.assert_not_called()
+
+    def test_tick_quarantine_returns_before_lock_and_due_scan(self, monkeypatch):
+        """Desktop/manual tick paths honor the same fail-closed env gate."""
+        from cron.scheduler import tick
+
+        monkeypatch.setenv("HERMES_CRON_PAUSED", "unexpected-value")
+        with patch("cron.scheduler._get_lock_paths") as lock_paths, patch(
+            "cron.scheduler.get_due_jobs"
+        ) as get_due:
+            assert tick(verbose=False, sync=True, can_dispatch=lambda: True) == 0
+
+        lock_paths.assert_not_called()
+        get_due.assert_not_called()
+
+    def test_tick_pause_after_due_scan_returns_before_schedule_advance(
+        self, tmp_path, monkeypatch
+    ):
+        """A reload racing the due scan cannot consume the due occurrence."""
+        from cron.scheduler import tick
+
+        monkeypatch.delenv("HERMES_CRON_PAUSED", raising=False)
+        job = {
+            "id": "pause-after-scan",
+            "name": "pause after scan",
+            "schedule": {"kind": "interval", "seconds": 60},
+            "next_run_at": "2020-01-01T00:00:00+00:00",
+            "enabled": True,
+        }
+
+        def due_then_pause():
+            monkeypatch.setenv("HERMES_CRON_PAUSED", "true")
+            return [job]
+
+        with patch(
+            "cron.scheduler._get_lock_paths",
+            return_value=(tmp_path, tmp_path / "tick.lock"),
+        ), patch(
+            "cron.scheduler.get_due_jobs", side_effect=due_then_pause
+        ), patch("cron.jobs.advance_next_runs") as advance, patch(
+            "cron.scheduler.claim_job_for_fire"
+        ) as claim, patch("cron.scheduler.run_one_job") as run_one:
+            assert tick(verbose=False, sync=True, can_dispatch=lambda: True) == 0
+
+        advance.assert_not_called()
+        claim.assert_not_called()
+        run_one.assert_not_called()
+
+    def test_tick_pause_after_worker_claim_cancels_before_run(
+        self, tmp_path, monkeypatch
+    ):
+        from cron.scheduler import tick
+
+        monkeypatch.delenv("HERMES_CRON_PAUSED", raising=False)
+        job = {
+            "id": "pause-after-claim",
+            "name": "pause after claim",
+            "schedule": {"kind": "interval", "seconds": 60},
+            "next_run_at": "2020-01-01T00:00:00+00:00",
+            "enabled": True,
+        }
+
+        def claim_then_pause(job_id, **kwargs):
+            monkeypatch.setenv("HERMES_CRON_PAUSED", "true")
+            return {
+                **job,
+                "fire_claim": {"by": "worker-owner", "at": "now"},
+            }
+
+        with patch(
+            "cron.scheduler._get_lock_paths",
+            return_value=(tmp_path, tmp_path / "tick.lock"),
+        ), patch("cron.scheduler.get_due_jobs", return_value=[job]), patch(
+            "cron.scheduler.create_execution",
+            return_value={"id": "execution-paused"},
+        ), patch(
+            "cron.scheduler.claim_job_for_fire", side_effect=claim_then_pause
+        ), patch("cron.scheduler.cancel_claimed_fire_for_pause") as cancel, patch(
+            "cron.scheduler.run_one_job"
+        ) as run_one:
+            assert tick(verbose=False, sync=True, can_dispatch=lambda: True) == 1
+
+        cancel.assert_called_once()
+        assert cancel.call_args.args[0]["execution_id"] == "execution-paused"
+        run_one.assert_not_called()
+
+    def test_tick_pause_before_worker_claim_cleans_due_scan_run_claim(
+        self, tmp_path, monkeypatch
+    ):
+        from cron.scheduler import tick
+
+        monkeypatch.delenv("HERMES_CRON_PAUSED", raising=False)
+        job = {
+            "id": "pause-before-claim",
+            "name": "pause before claim",
+            "schedule": {"kind": "once", "run_at": "2020-01-01T00:00:00+00:00"},
+            "next_run_at": "2020-01-01T00:00:00+00:00",
+            "enabled": True,
+            "run_claim": {"by": "due-scan-owner", "at": "now"},
+        }
+
+        def pause_then_lose_claim(job_id, **kwargs):
+            monkeypatch.setenv("HERMES_CRON_PAUSED", "true")
+            return False
+
+        with patch(
+            "cron.scheduler._get_lock_paths",
+            return_value=(tmp_path, tmp_path / "tick.lock"),
+        ), patch("cron.scheduler.get_due_jobs", return_value=[job]), patch(
+            "cron.scheduler.create_execution",
+            return_value={"id": "execution-paused"},
+        ), patch(
+            "cron.scheduler.claim_job_for_fire", side_effect=pause_then_lose_claim
+        ), patch("cron.scheduler.cancel_claimed_fire_for_pause") as cancel, patch(
+            "cron.scheduler.finish_execution"
+        ) as finish, patch("cron.scheduler.run_one_job") as run_one:
+            assert tick(verbose=False, sync=True, can_dispatch=lambda: True) == 1
+
+        cancel.assert_called_once()
+        assert cancel.call_args.args[0]["run_claim"]["by"] == "due-scan-owner"
+        finish.assert_not_called()
         run_one.assert_not_called()
 
     def test_tick_marks_empty_response_as_error(self, tmp_path):
@@ -2613,3 +2743,56 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
+
+
+
+
+class TestFailureStreakNudge:
+    """Poke-inspired repeated-failure review nudge (_failure_streak_nudge)."""
+
+    def _job(self, streak, kind="cron", name="scout"):
+        return {
+            "id": "j1",
+            "name": name,
+            "failure_streak": streak,
+            "schedule": {"kind": kind},
+        }
+
+    def test_nudges_at_threshold(self):
+        from cron.scheduler import _failure_streak_nudge
+        # stored streak 2 + this run = 3 >= default threshold 3
+        with patch("cron.scheduler.load_config", return_value={}):
+            out = _failure_streak_nudge(self._job(2))
+        assert "failed 3 runs in a row" in out
+        assert "hermes cron pause scout" in out
+
+    def test_silent_below_threshold(self):
+        from cron.scheduler import _failure_streak_nudge
+        with patch("cron.scheduler.load_config", return_value={}):
+            assert _failure_streak_nudge(self._job(0)) == ""
+            assert _failure_streak_nudge(self._job(1)) == ""
+
+    def test_oneshot_never_nudges(self):
+        from cron.scheduler import _failure_streak_nudge
+        with patch("cron.scheduler.load_config", return_value={}):
+            assert _failure_streak_nudge(self._job(10, kind="once")) == ""
+
+    def test_config_threshold_and_disable(self):
+        from cron.scheduler import _failure_streak_nudge
+        cfg5 = {"cron": {"failure_nudge_threshold": 5}}
+        with patch("cron.scheduler.load_config", return_value=cfg5):
+            assert _failure_streak_nudge(self._job(3)) == ""
+            assert "failed 5 runs" in _failure_streak_nudge(self._job(4))
+        with patch("cron.scheduler.load_config", return_value={"cron": {"failure_nudge_threshold": 0}}):
+            assert _failure_streak_nudge(self._job(50)) == ""
+
+    def test_missing_streak_field_backcompat(self):
+        from cron.scheduler import _failure_streak_nudge
+        job = {"id": "old", "schedule": {"kind": "interval"}}  # pre-field job
+        with patch("cron.scheduler.load_config", return_value={}):
+            assert _failure_streak_nudge(job) == ""
+
+    def test_config_load_failure_falls_back(self):
+        from cron.scheduler import _failure_streak_nudge
+        with patch("cron.scheduler.load_config", side_effect=RuntimeError("boom")):
+            assert "failed 3 runs" in _failure_streak_nudge(self._job(2))

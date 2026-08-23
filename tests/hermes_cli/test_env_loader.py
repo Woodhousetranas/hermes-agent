@@ -1,9 +1,25 @@
+import base64
 import codecs
 import importlib
+import json
 import os
 import sys
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from hermes_cli.env_loader import load_hermes_dotenv
+
+
+@pytest.fixture(autouse=True)
+def reset_cron_pause_latch():
+    import cron.jobs as jobs
+
+    jobs._reset_cron_dispatch_pause_latch_for_tests()
+    yield
+    jobs._reset_cron_dispatch_pause_latch_for_tests()
 
 
 def test_recovered_update_retry_skips_external_secret_sources(tmp_path, monkeypatch):
@@ -349,6 +365,893 @@ def test_cp1252_env_regression_does_not_crash(tmp_path, monkeypatch):
     assert os.getenv("LATIN1_VALUE") == "café"
     # Sanitize must not have rewritten (would have persisted U+FFFD).
     assert env_file.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# Detached gateway launch provenance lock
+# ---------------------------------------------------------------------------
+
+
+def _reset_gateway_launch_env_lock(monkeypatch):
+    import hermes_cli.env_loader as env_loader
+
+    monkeypatch.setattr(
+        env_loader, "_GATEWAY_LAUNCH_ENV_CAPTURE_ATTEMPTED", False
+    )
+    monkeypatch.setattr(env_loader, "_GATEWAY_LAUNCH_ENV_STATE", None)
+    monkeypatch.setattr(env_loader, "_GATEWAY_LAUNCH_ENV_ERROR", None)
+    monkeypatch.setattr(
+        env_loader, "_GATEWAY_START_VALIDATOR_ATTEMPTED", False
+    )
+    monkeypatch.setattr(env_loader, "_GATEWAY_START_VALIDATOR_ERROR", None)
+    monkeypatch.setattr(env_loader, "_GATEWAY_START_PROVENANCE", None)
+    monkeypatch.delenv(env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR, raising=False)
+    return env_loader
+
+
+def _managed_gateway_lock_values(env_loader, home: Path, cwd: Path) -> dict[str, str]:
+    runtime_path = r"C:\Reviewed\venv\Scripts;C:\Windows\System32"
+    return {
+        "HERMES_HOME": str(home),
+        "HERMES_RUNTIME_HOME": str(home),
+        "GLADLY_HERMES_CODE_ROOT": str(cwd),
+        "PYTHONPATH": str(Path(env_loader.__file__).resolve().parent.parent),
+        "VIRTUAL_ENV": str(home / "venv"),
+        "HERMES_GATEWAY_RUNTIME_PATH": runtime_path,
+        "PATH": runtime_path,
+        "HERMES_GATEWAY_START_VALIDATOR": str(Path(sys.executable).resolve()),
+        "HERMES_GATEWAY_START_VALIDATOR_ARGS": (
+            env_loader._encode_gateway_start_validator_args(["validate-start"])
+        ),
+    }
+
+
+def test_managed_gateway_lock_requires_complete_v3_validator_provenance(tmp_path):
+    import hermes_cli.env_loader as env_loader
+
+    home = tmp_path / "home"
+    cwd = tmp_path / "reviewed"
+    values = _managed_gateway_lock_values(env_loader, home, cwd)
+    for missing in env_loader._GATEWAY_MANAGED_PROVENANCE_ENV_KEYS:
+        incomplete = dict(values)
+        incomplete.pop(missing)
+        with pytest.raises(ValueError, match=missing):
+            env_loader._encode_gateway_launch_env_lock(incomplete, cwd)
+
+    encoded = env_loader._encode_gateway_launch_env_lock(values, cwd)
+    decoded, decoded_cwd = env_loader._decode_gateway_launch_env_lock(encoded)
+    assert decoded == values
+    assert decoded_cwd == str(cwd)
+
+
+def test_managed_gateway_runtime_requires_validator_confirmed_v3_state(
+    tmp_path, monkeypatch
+):
+    env_loader = _reset_gateway_launch_env_lock(monkeypatch)
+    home = tmp_path / "home"
+    cwd = tmp_path / "reviewed"
+    values = _managed_gateway_lock_values(env_loader, home, cwd)
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+
+    with pytest.raises(RuntimeError, match="without validator-confirmed"):
+        env_loader._assert_gateway_start_provenance_if_managed()
+
+    monkeypatch.setattr(
+        env_loader,
+        "_GATEWAY_LAUNCH_ENV_STATE",
+        (values, str(cwd)),
+    )
+    with pytest.raises(RuntimeError, match="without validator-confirmed"):
+        env_loader._assert_gateway_start_provenance_if_managed()
+
+    provenance = {
+        "version": 1,
+        "receiptDigest": f"sha256:{'1' * 64}",
+        "manifestDigest": f"sha256:{'2' * 64}",
+        "taskEvidenceDigest": f"sha256:{'3' * 64}",
+    }
+    monkeypatch.setattr(env_loader, "_GATEWAY_START_PROVENANCE", provenance)
+    env_loader._assert_gateway_start_provenance_if_managed()
+
+
+def test_checkout_detected_managed_gateway_cannot_downgrade_by_unsetting_public_vars(
+    tmp_path, monkeypatch
+):
+    env_loader = _reset_gateway_launch_env_lock(monkeypatch)
+    for key in (
+        "HERMES_GATEWAY_RUNTIME_PATH",
+        "HERMES_GATEWAY_START_VALIDATOR",
+        "HERMES_GATEWAY_START_VALIDATOR_ARGS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(env_loader, "_managed_install_root", lambda: tmp_path)
+
+    with pytest.raises(RuntimeError, match="without validator-confirmed"):
+        env_loader._assert_gateway_start_provenance_if_managed()
+
+
+def test_managed_launch_rejects_caller_selected_validator_and_decoy_home(
+    tmp_path,
+):
+    import hermes_cli.env_loader as env_loader
+
+    root = tmp_path / "reviewed"
+    agent_root = root / "hermes-agent"
+    home = root / "home"
+    bun = root / "tools" / "bun.exe"
+    validator = root / "bridge" / "src" / "runtime-gateway-start-validator-cli.ts"
+    manifest = home / "state" / "runtime-bundle-manifest.json"
+    for directory in (
+        agent_root,
+        agent_root / "venv",
+        home,
+        bun.parent,
+        validator.parent,
+        manifest.parent,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+    bun.write_bytes(b"reviewed bun")
+    validator.write_text("export {};\n", encoding="utf-8")
+    manifest.write_text("{}\n", encoding="utf-8")
+    runtime_path = r"C:\Reviewed\tools;C:\Windows\System32"
+    argv = (str(validator), "--root", str(root), "--manifest", str(manifest))
+    expected_managed = {
+        "HERMES_GATEWAY_RUNTIME_PATH": runtime_path,
+        "PATH": runtime_path,
+        "HERMES_GATEWAY_START_VALIDATOR": str(bun),
+        "HERMES_GATEWAY_START_VALIDATOR_ARGS": (
+            env_loader._encode_gateway_start_validator_args(argv)
+        ),
+    }
+    values = {
+        "HERMES_HOME": str(home),
+        "HERMES_RUNTIME_HOME": str(home),
+        "GLADLY_HERMES_CODE_ROOT": str(root),
+        "PYTHONPATH": str(agent_root),
+        "VIRTUAL_ENV": str(agent_root / "venv"),
+        **expected_managed,
+    }
+    contract = {
+        "root": root,
+        "agentRoot": agent_root,
+        "home": home,
+        "managedValues": expected_managed,
+        "validatorArgv": argv,
+    }
+    poisoned = dict(values)
+    poisoned["HERMES_GATEWAY_START_VALIDATOR"] = str(tmp_path / "fake.exe")
+    with pytest.raises(ValueError, match="receipt-bound Bun"):
+        env_loader._assert_managed_launch_matches_install(
+            poisoned,
+            str(root),
+            contract,
+        )
+    decoy = dict(values)
+    decoy["HERMES_HOME"] = str(tmp_path / "clean-decoy-home")
+    with pytest.raises(ValueError, match="redirects outside"):
+        env_loader._assert_managed_launch_matches_install(
+            decoy,
+            str(root),
+            contract,
+        )
+
+
+def test_receipt_bound_validator_rejects_forged_but_well_shaped_output(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.env_loader as env_loader
+    import hermes_cli.gateway_windows as gateway_windows
+
+    root = tmp_path / "reviewed"
+    agent_root = root / "hermes-agent"
+    home = root / "home"
+    bun = root / "tools" / "bun.exe"
+    validator = root / "bridge" / "src" / "runtime-gateway-start-validator-cli.ts"
+    manifest = home / "state" / "runtime-bundle-manifest.json"
+    for directory in (agent_root / "venv", bun.parent, validator.parent, manifest.parent):
+        directory.mkdir(parents=True, exist_ok=True)
+    bun.write_bytes(b"reviewed bun")
+    validator.write_text("export {};\n", encoding="utf-8")
+    manifest.write_text("{}\n", encoding="utf-8")
+    runtime_path = r"C:\Reviewed\tools;C:\Windows\System32"
+    argv = (str(validator), "--root", str(root), "--manifest", str(manifest))
+    managed = {
+        "HERMES_GATEWAY_RUNTIME_PATH": runtime_path,
+        "PATH": runtime_path,
+        "HERMES_GATEWAY_START_VALIDATOR": str(bun),
+        "HERMES_GATEWAY_START_VALIDATOR_ARGS": (
+            env_loader._encode_gateway_start_validator_args(argv)
+        ),
+    }
+    values = {
+        "HERMES_HOME": str(home),
+        "HERMES_RUNTIME_HOME": str(home),
+        "GLADLY_HERMES_CODE_ROOT": str(root),
+        "PYTHONPATH": str(agent_root),
+        "VIRTUAL_ENV": str(agent_root / "venv"),
+        **managed,
+    }
+    measured = {"path": str(bun), "fileDigest": f"sha256:{'a' * 64}", "identity": (1,) * 7}
+    contract = {
+        "root": root,
+        "agentRoot": agent_root,
+        "home": home,
+        "receiptPath": agent_root / "venv" / ".gladly-runtime-install.json",
+        "receiptDigest": f"sha256:{'1' * 64}",
+        "bunPath": str(bun),
+        "bunIdentityDigest": f"sha256:{'2' * 64}",
+        "validatorScript": validator,
+        "manifestPath": manifest,
+        "validatorArgv": argv,
+        "managedValues": managed,
+        "receiptFile": measured,
+        "bunFile": measured,
+        "validatorFile": measured,
+    }
+    expected = {
+        "provenance": {
+            "version": 1,
+            "receiptDigest": f"sha256:{'1' * 64}",
+            "manifestDigest": f"sha256:{'2' * 64}",
+            "taskEvidenceDigest": f"sha256:{'3' * 64}",
+        },
+        "manifestFile": measured,
+        "loaderFile": measured,
+        "closureFiles": {},
+    }
+    monkeypatch.setattr(env_loader, "_managed_start_expectations", lambda _value: expected)
+    monkeypatch.setattr(env_loader, "_managed_install_contract", lambda: contract)
+    monkeypatch.setattr(env_loader, "_validator_file_identity", lambda _path: (1,) * 7)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_managed_gateway_child_environment",
+        lambda _values: {"PATH": runtime_path},
+    )
+    monkeypatch.setattr(
+        env_loader.subprocess,
+        "run",
+        lambda _argv, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"version":1,'
+                f'"receiptDigest":"sha256:{"9" * 64}",'
+                f'"manifestDigest":"sha256:{"2" * 64}",'
+                f'"taskEvidenceDigest":"sha256:{"3" * 64}"}}'
+            ),
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="does not match trusted provenance"):
+        env_loader._execute_gateway_start_validator(values, str(root), contract)
+
+
+def test_managed_start_pre_attests_entire_bun_validator_import_closure(tmp_path):
+    import hermes_cli.env_loader as env_loader
+
+    root = tmp_path / "reviewed"
+    source = root / "bridge" / "src"
+    manifest_path = root / "home" / "state" / "runtime-bundle-manifest.json"
+    source.mkdir(parents=True)
+    manifest_path.parent.mkdir(parents=True)
+    validator = source / "runtime-gateway-start-validator-cli.ts"
+    validator.write_text("export {};\n", encoding="utf-8")
+    closure_files = {}
+    for dependency in env_loader._GLADLY_GATEWAY_VALIDATOR_IMPORT_CLOSURE:
+        path = source / dependency
+        path.write_text(f"// reviewed {dependency}\n", encoding="utf-8")
+        closure_files[dependency] = env_loader._stable_regular_file(
+            path,
+            f"fixture {dependency}",
+        )
+    loader_file = env_loader._stable_regular_file(
+        Path(env_loader.__file__),
+        "fixture environment loader",
+    )
+    validator_file = env_loader._stable_regular_file(
+        validator,
+        "fixture validator",
+    )
+    receipt_digest = f"sha256:{'1' * 64}"
+    bun_identity = f"sha256:{'2' * 64}"
+    task_digest = f"sha256:{'3' * 64}"
+    tools = [
+        {"id": "runtime/install-receipt", "digest": receipt_digest},
+        {"id": "runtime/bun-executable", "digest": bun_identity},
+        {
+            "id": "runtime/gateway-start-validator",
+            "digest": validator_file["fileDigest"],
+        },
+        {
+            "id": "runtime/windows-gateway-env-loader",
+            "digest": loader_file["fileDigest"],
+        },
+        {"id": "runtime/windows-gateway-evidence", "digest": task_digest},
+        *(
+            {
+                "id": f"runtime/windows-gateway-disable-import/{dependency}",
+                "digest": measured["fileDigest"],
+            }
+            for dependency, measured in closure_files.items()
+        ),
+    ]
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schemaVersion": "hermes.runtime_bundle_manifest.v1",
+                "digest": f"sha256:{'4' * 64}",
+                "tools": tools,
+            }
+        ),
+        encoding="utf-8",
+    )
+    contract = {
+        "root": root,
+        "manifestPath": manifest_path,
+        "receiptDigest": receipt_digest,
+        "bunIdentityDigest": bun_identity,
+        "validatorFile": validator_file,
+    }
+
+    expected = env_loader._managed_start_expectations(contract)
+    assert set(expected["closureFiles"]) == set(
+        env_loader._GLADLY_GATEWAY_VALIDATOR_IMPORT_CLOSURE
+    )
+
+    (source / "runtime-release-gate.ts").write_text(
+        "// forged release gate\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="runtime-release-gate.ts is not manifest-bound"):
+        env_loader._managed_start_expectations(contract)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "e30",  # JSON object, not argv
+        "W10",  # empty argv
+        "WyIiXQ",  # empty item
+        "WyJvayJd=",  # padding is intentionally non-canonical
+    ],
+)
+def test_managed_gateway_validator_args_reject_noncanonical_shapes(raw):
+    import hermes_cli.env_loader as env_loader
+
+    with pytest.raises(ValueError, match="validator"):
+        env_loader._decode_gateway_start_validator_args(raw)
+
+
+def test_managed_gateway_validator_args_reject_noncanonical_json_bytes():
+    import hermes_cli.env_loader as env_loader
+
+    raw = base64.urlsafe_b64encode(b'["validate-start" ]').decode("ascii").rstrip("=")
+    with pytest.raises(ValueError, match="canonical JSON"):
+        env_loader._decode_gateway_start_validator_args(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        (
+            '{"version":1,'
+            f'"receiptDigest":"sha256:{"1" * 64}",'
+            f'"receiptDigest":"sha256:{"1" * 64}",'
+            f'"manifestDigest":"sha256:{"2" * 64}",'
+            f'"taskEvidenceDigest":"sha256:{"3" * 64}"}}'
+        ),
+        (
+            '{"version":1,'
+            f'"receiptDigest":"sha256:{"1" * 64}",'
+            f'"manifestDigest":"sha256:{"2" * 64}",'
+            f'"taskEvidenceDigest":"sha256:{"3" * 64}",'
+            '"unknown":true}'
+        ),
+        (
+            '{"version":true,'
+            f'"receiptDigest":"sha256:{"1" * 64}",'
+            f'"manifestDigest":"sha256:{"2" * 64}",'
+            f'"taskEvidenceDigest":"sha256:{"3" * 64}"}}'
+        ),
+        (
+            '{"version":1,'
+            f'"receiptDigest":"sha256:{"A" * 64}",'
+            f'"manifestDigest":"sha256:{"2" * 64}",'
+            f'"taskEvidenceDigest":"sha256:{"3" * 64}"}}'
+        ),
+    ],
+)
+def test_managed_gateway_provenance_rejects_duplicate_unknown_or_bad_fields(raw):
+    import hermes_cli.env_loader as env_loader
+
+    with pytest.raises(ValueError):
+        env_loader._decode_gateway_start_provenance(raw)
+
+
+def test_managed_gateway_validator_runs_after_dotenv_before_external_sources(
+    tmp_path,
+    monkeypatch,
+):
+    import hermes_cli.env_loader as env_loader
+    import hermes_cli.gateway_windows as gateway_windows
+
+    env_loader = _reset_gateway_launch_env_lock(monkeypatch)
+    home = tmp_path / "home"
+    cwd = tmp_path / "reviewed"
+    home.mkdir()
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    values = _managed_gateway_lock_values(env_loader, home, cwd)
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv(
+        env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR,
+        env_loader._encode_gateway_launch_env_lock(values, cwd),
+    )
+    poison = tmp_path / "poison.py"
+    (home / ".env").write_text(
+        "\n".join(
+            (
+                "NODE_OPTIONS=--require=poison.js",
+                f"PYTHONSTARTUP={poison}",
+                f"HERMES_RUNTIME_MANIFEST_DIGEST=sha256:{'f' * 64}",
+                "DOTENV_READY=yes",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    events: list[str] = []
+
+    def fake_child_environment(launch_values):
+        return {
+            "PATH": launch_values["PATH"],
+            "HERMES_HOME": launch_values["HERMES_HOME"],
+        }
+
+    monkeypatch.setattr(
+        gateway_windows,
+        "_managed_gateway_child_environment",
+        fake_child_environment,
+    )
+    monkeypatch.setattr(env_loader, "_validator_file_identity", lambda _path: (1,) * 6)
+
+    def fake_run(argv, **kwargs):
+        events.append("validator")
+        assert os.environ["DOTENV_READY"] == "yes"
+        assert argv == [str(Path(sys.executable).resolve()), "validate-start"]
+        assert "NODE_OPTIONS" not in kwargs["env"]
+        assert "PYTHONSTARTUP" not in kwargs["env"]
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"version":1,'
+                f'"receiptDigest":"sha256:{"1" * 64}",'
+                f'"manifestDigest":"sha256:{"2" * 64}",'
+                f'"taskEvidenceDigest":"sha256:{"3" * 64}"}}'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(env_loader.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        env_loader,
+        "_apply_external_secret_sources",
+        lambda _home: events.append("external"),
+    )
+    monkeypatch.setattr(env_loader, "_apply_managed_env", lambda: None)
+    monkeypatch.setattr(
+        env_loader, "_reapply_terminal_config_bridge", lambda _home: None
+    )
+
+    env_loader.load_hermes_dotenv(hermes_home=home)
+    env_loader.load_hermes_dotenv(hermes_home=home)
+
+    assert events == ["validator", "external", "external"]
+    assert env_loader._gateway_start_provenance() == {
+        "version": 1,
+        "receiptDigest": f"sha256:{'1' * 64}",
+        "manifestDigest": f"sha256:{'2' * 64}",
+        "taskEvidenceDigest": f"sha256:{'3' * 64}",
+    }
+
+
+def test_managed_gateway_validator_blocks_concurrent_loaders_until_provenance(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.env_loader as env_loader
+    import hermes_cli.gateway_windows as gateway_windows
+
+    env_loader = _reset_gateway_launch_env_lock(monkeypatch)
+    home = tmp_path / "home"
+    cwd = tmp_path / "reviewed"
+    home.mkdir()
+    cwd.mkdir()
+    values = _managed_gateway_lock_values(env_loader, home, cwd)
+    monkeypatch.setattr(env_loader, "_GATEWAY_LAUNCH_ENV_STATE", (values, str(cwd)))
+    monkeypatch.setattr(
+        gateway_windows,
+        "_managed_gateway_child_environment",
+        lambda _values: {"PATH": values["PATH"]},
+    )
+    monkeypatch.setattr(env_loader, "_validator_file_identity", lambda _path: (1,) * 7)
+
+    validator_entered = threading.Event()
+    release_validator = threading.Event()
+    second_entered = threading.Event()
+    second_finished = threading.Event()
+    calls: list[int] = []
+    errors: list[BaseException] = []
+
+    def fake_run(_argv, **_kwargs):
+        calls.append(1)
+        validator_entered.set()
+        assert release_validator.wait(5)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"version":1,'
+                f'"receiptDigest":"sha256:{"1" * 64}",'
+                f'"manifestDigest":"sha256:{"2" * 64}",'
+                f'"taskEvidenceDigest":"sha256:{"3" * 64}"}}'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(env_loader.subprocess, "run", fake_run)
+
+    def first_loader():
+        try:
+            env_loader._run_gateway_start_validator_if_needed()
+        except BaseException as exc:  # noqa: BLE001 - surface thread failures
+            errors.append(exc)
+
+    def second_loader():
+        second_entered.set()
+        try:
+            env_loader._run_gateway_start_validator_if_needed()
+        except BaseException as exc:  # noqa: BLE001 - surface thread failures
+            errors.append(exc)
+        finally:
+            second_finished.set()
+
+    first = threading.Thread(target=first_loader)
+    second = threading.Thread(target=second_loader)
+    first.start()
+    assert validator_entered.wait(5)
+    second.start()
+    assert second_entered.wait(5)
+    assert not second_finished.wait(0.1)
+    release_validator.set()
+    first.join(5)
+    second.join(5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert calls == [1]
+    assert second_finished.is_set()
+
+
+def test_gateway_launch_env_lock_survives_dotenv_and_later_reload(
+    tmp_path, monkeypatch
+):
+    """Launcher provenance beats user/project/managed reloads for process life."""
+    env_loader = _reset_gateway_launch_env_lock(monkeypatch)
+    reviewed_cwd = tmp_path / "reviewed-repo"
+    home = tmp_path / "runtime-home"
+    venv = tmp_path / "reviewed-venv"
+    reviewed_cwd.mkdir()
+    home.mkdir()
+    venv.mkdir()
+    monkeypatch.chdir(reviewed_cwd)
+
+    locked = {
+        "HERMES_HOME": str(home),
+        "HERMES_RUNTIME_HOME": str(home),
+        "GLADLY_HERMES_CODE_ROOT": str(reviewed_cwd),
+        "PYTHONPATH": str(Path(env_loader.__file__).resolve().parent.parent),
+        "VIRTUAL_ENV": str(venv),
+        "HERMES_GATEWAY_RUNTIME_PATH": (
+            r"C:\Reviewed\venv\Scripts;C:\Windows\System32"
+        ),
+        "PATH": r"C:\Reviewed\venv\Scripts;C:\Windows\System32",
+        "HERMES_GATEWAY_START_VALIDATOR": str(Path(sys.executable).resolve()),
+        "HERMES_GATEWAY_START_VALIDATOR_ARGS": (
+            env_loader._encode_gateway_start_validator_args(["validate-start"])
+        ),
+    }
+    for key, value in locked.items():
+        monkeypatch.setenv(key, value)
+    marker = env_loader._encode_gateway_launch_env_lock(locked, reviewed_cwd)
+    monkeypatch.setenv(env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR, marker)
+
+    poison = str(tmp_path / "old-host")
+    (home / ".env").write_text(
+        "\n".join(
+            [
+                *(f"{key}={poison}" for key in locked),
+                f"{env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR}=not-the-launch-marker",
+                "LOCK_RELOAD_PROBE=first",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    def poison_managed_env():
+        for key in locked:
+            os.environ[key] = poison + "-managed"
+
+    def poison_config_bridge(_home):
+        for key in locked:
+            os.environ[key] = poison + "-config"
+
+    monkeypatch.setattr(env_loader, "_apply_managed_env", poison_managed_env)
+    monkeypatch.setattr(
+        env_loader, "_reapply_terminal_config_bridge", poison_config_bridge
+    )
+    monkeypatch.setattr(
+        env_loader, "_run_gateway_start_validator_if_needed", lambda: None
+    )
+
+    env_loader.load_hermes_dotenv(load_external_secrets=False)
+
+    assert {key: os.environ[key] for key in locked} == locked
+    assert env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR not in os.environ
+    assert os.getcwd() == str(reviewed_cwd)
+    assert os.environ["LOCK_RELOAD_PROBE"] == "first"
+
+    # Simulate arbitrary in-process mutation before the gateway's per-turn
+    # dotenv reload. The captured snapshot, not a newly injected marker, wins.
+    for key in locked:
+        monkeypatch.setenv(key, poison + "-between-turns")
+    monkeypatch.setenv(env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR, "replacement")
+    (home / ".env").write_text(
+        (home / ".env").read_text(encoding="utf-8").replace("first", "second"),
+        encoding="utf-8",
+    )
+
+    env_loader.load_hermes_dotenv(load_external_secrets=False)
+
+    assert {key: os.environ[key] for key in locked} == locked
+    assert env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR not in os.environ
+    assert os.environ["LOCK_RELOAD_PROBE"] == "second"
+
+
+def test_gateway_launch_env_lock_isolates_external_secret_source_mapping(
+    tmp_path, monkeypatch
+):
+    """Secret plugins never receive process-global protected keys to mutate."""
+    from types import SimpleNamespace
+
+    from agent.secret_sources import registry
+
+    env_loader = _reset_gateway_launch_env_lock(monkeypatch)
+    home = tmp_path / "home"
+    reviewed_cwd = tmp_path / "reviewed"
+    home.mkdir()
+    reviewed_cwd.mkdir()
+    locked = {
+        "HERMES_HOME": str(home),
+        "HERMES_RUNTIME_HOME": str(home),
+        "GLADLY_HERMES_CODE_ROOT": str(reviewed_cwd),
+        "PYTHONPATH": str(Path(env_loader.__file__).resolve().parent.parent),
+        "VIRTUAL_ENV": str(tmp_path / "venv"),
+    }
+    for key, value in locked.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("HERMES_CRON_PAUSED", "false")
+    monkeypatch.setattr(
+        env_loader,
+        "_GATEWAY_LAUNCH_ENV_STATE",
+        (dict(locked), str(reviewed_cwd)),
+    )
+    monkeypatch.setattr(env_loader, "_APPLIED_HOMES", set())
+    monkeypatch.setattr(
+        env_loader,
+        "_load_secrets_config",
+        lambda _home: {"test-source": {"enabled": True}},
+    )
+
+    def fake_apply_all(_cfg, _home, *, environ=None):
+        assert environ is not None
+        assert environ is not os.environ
+        # Simulate an operator pausing dispatch while a slow vault fetch is in
+        # flight. Merging the entire baseline copy afterwards would undo it.
+        os.environ["HERMES_CRON_PAUSED"] = "true"
+        environ["HERMES_HOME"] = "poisoned-by-source"
+        environ["UNLOCKED_SOURCE_PROBE"] = "applied"
+        return SimpleNamespace(sources=[], applied_any=False, conflicts=[])
+
+    monkeypatch.setattr(registry, "apply_all", fake_apply_all)
+
+    env_loader._apply_external_secret_sources(home)
+
+    assert os.environ["HERMES_HOME"] == str(home)
+    assert os.environ["HERMES_CRON_PAUSED"] == "true"
+    assert os.environ["UNLOCKED_SOURCE_PROBE"] == "applied"
+    monkeypatch.setenv("HERMES_CRON_PAUSED", "false")
+    from cron.jobs import is_cron_dispatch_paused
+
+    assert is_cron_dispatch_paused() is True
+
+
+def test_cron_pause_latches_across_later_profile_false_reload(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.env_loader as env_loader
+    from cron.jobs import is_cron_dispatch_paused
+
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    primary.mkdir()
+    secondary.mkdir()
+    (primary / ".env").write_text(
+        "HERMES_CRON_PAUSED=true\n", encoding="utf-8"
+    )
+    (secondary / ".env").write_text(
+        "HERMES_CRON_PAUSED=false\n", encoding="utf-8"
+    )
+    monkeypatch.delenv("HERMES_CRON_PAUSED", raising=False)
+    monkeypatch.setattr(env_loader, "_apply_managed_env", lambda: None)
+
+    env_loader.load_hermes_dotenv(
+        hermes_home=primary, load_external_secrets=False
+    )
+    assert is_cron_dispatch_paused() is True
+
+    env_loader.load_hermes_dotenv(
+        hermes_home=secondary, load_external_secrets=False
+    )
+    assert os.environ["HERMES_CRON_PAUSED"] == "false"
+    assert is_cron_dispatch_paused() is True
+
+
+def test_inherited_cron_pause_latches_before_dotenv_false_override(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.env_loader as env_loader
+    from cron.jobs import is_cron_dispatch_paused
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text(
+        "HERMES_CRON_PAUSED=false\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_CRON_PAUSED", "true")
+    monkeypatch.setattr(env_loader, "_apply_managed_env", lambda: None)
+
+    env_loader.load_hermes_dotenv(
+        hermes_home=home, load_external_secrets=False
+    )
+
+    assert os.environ["HERMES_CRON_PAUSED"] == "false"
+    assert is_cron_dispatch_paused() is True
+
+
+def test_dotenv_cannot_activate_gateway_launch_lock_after_start(
+    tmp_path, monkeypatch
+):
+    """Only the marker present before the first load can activate the lock."""
+    env_loader = _reset_gateway_launch_env_lock(monkeypatch)
+    home = tmp_path / "runtime-home"
+    reviewed_cwd = tmp_path / "reviewed-repo"
+    venv = tmp_path / "venv"
+    home.mkdir()
+    reviewed_cwd.mkdir()
+    venv.mkdir()
+    monkeypatch.chdir(reviewed_cwd)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    attacker_values = {
+        "HERMES_HOME": str(home),
+        "HERMES_RUNTIME_HOME": str(home),
+        "GLADLY_HERMES_CODE_ROOT": str(reviewed_cwd),
+        "PYTHONPATH": "attacker-pythonpath",
+        "VIRTUAL_ENV": "attacker-venv",
+    }
+    injected_marker = env_loader._encode_gateway_launch_env_lock(
+        attacker_values, reviewed_cwd
+    )
+    (home / ".env").write_text(
+        "\n".join(
+            [
+                *(f"{key}={value}" for key, value in attacker_values.items()),
+                f"{env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR}={injected_marker}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(env_loader, "_apply_managed_env", lambda: None)
+    monkeypatch.setattr(
+        env_loader, "_reapply_terminal_config_bridge", lambda _home: None
+    )
+
+    env_loader.load_hermes_dotenv(load_external_secrets=False)
+    assert env_loader._GATEWAY_LAUNCH_ENV_STATE is None
+    assert env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR not in os.environ
+    assert os.environ["VIRTUAL_ENV"] == "attacker-venv"
+
+    # A second reload still cannot capture the marker that came from .env.
+    env_loader.load_hermes_dotenv(hermes_home=home, load_external_secrets=False)
+    assert env_loader._GATEWAY_LAUNCH_ENV_STATE is None
+    assert env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR not in os.environ
+
+
+def test_invalid_gateway_launch_env_lock_fails_closed(tmp_path, monkeypatch):
+    env_loader = _reset_gateway_launch_env_lock(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR, "not-base64")
+
+    with pytest.raises(RuntimeError, match="Refusing detached gateway startup"):
+        env_loader.load_hermes_dotenv(
+            hermes_home=tmp_path,
+            load_external_secrets=False,
+        )
+
+
+def test_gateway_launch_env_lock_rejects_wrong_initial_cwd(tmp_path, monkeypatch):
+    env_loader = _reset_gateway_launch_env_lock(monkeypatch)
+    actual_cwd = tmp_path / "actual"
+    expected_cwd = tmp_path / "expected"
+    home = tmp_path / "home"
+    venv = tmp_path / "venv"
+    for path in (actual_cwd, expected_cwd, home, venv):
+        path.mkdir()
+    monkeypatch.chdir(actual_cwd)
+    locked = {
+        "HERMES_HOME": str(home),
+        "HERMES_RUNTIME_HOME": str(home),
+        "GLADLY_HERMES_CODE_ROOT": str(expected_cwd),
+        "PYTHONPATH": str(expected_cwd),
+        "VIRTUAL_ENV": str(venv),
+    }
+    monkeypatch.setenv(
+        env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR,
+        env_loader._encode_gateway_launch_env_lock(locked, expected_cwd),
+    )
+
+    with pytest.raises(RuntimeError, match="Refusing detached gateway startup"):
+        env_loader.load_hermes_dotenv(
+            hermes_home=home,
+            load_external_secrets=False,
+        )
+
+
+def test_gateway_launch_env_lock_rejects_public_env_mismatch(
+    tmp_path, monkeypatch
+):
+    env_loader = _reset_gateway_launch_env_lock(monkeypatch)
+    reviewed_cwd = tmp_path / "reviewed"
+    home = tmp_path / "home"
+    venv = tmp_path / "venv"
+    for path in (reviewed_cwd, home, venv):
+        path.mkdir()
+    monkeypatch.chdir(reviewed_cwd)
+    locked = {
+        "HERMES_HOME": str(home),
+        "HERMES_RUNTIME_HOME": str(home),
+        "GLADLY_HERMES_CODE_ROOT": str(reviewed_cwd),
+        "PYTHONPATH": str(Path(env_loader.__file__).resolve().parent.parent),
+        "VIRTUAL_ENV": str(venv),
+    }
+    for key, value in locked.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("HERMES_RUNTIME_HOME", str(tmp_path / "stale-runtime"))
+    monkeypatch.setenv(
+        env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR,
+        env_loader._encode_gateway_launch_env_lock(locked, reviewed_cwd),
+    )
+
+    with pytest.raises(RuntimeError, match="Refusing detached gateway startup"):
+        env_loader.load_hermes_dotenv(
+            hermes_home=home,
+            load_external_secrets=False,
+        )
 
 
 # ---------------------------------------------------------------------------

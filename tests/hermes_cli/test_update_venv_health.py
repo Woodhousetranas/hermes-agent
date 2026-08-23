@@ -108,7 +108,7 @@ def _update_args(**overrides):
     return SimpleNamespace(**defaults)
 
 
-def _run_update_until_guard(args):
+def _run_update_until_guard(args, *, holders=None):
     """Drive _cmd_update_impl just far enough to hit the venv-holder guard.
 
     Everything before the guard is stubbed; the guard firing is observed via
@@ -123,6 +123,9 @@ def _run_update_until_guard(args):
         def __truediv__(self, _other):
             raise _PastGuard
 
+    if holders is None:
+        holders = [(101, "python.exe", "python.exe -m hermes_cli.main serve")]
+
     with patch.object(cli_main, "_is_windows", return_value=True), patch.object(
         cli_main, "_venv_scripts_dir", return_value=None
     ), patch.object(cli_main, "_run_pre_update_backup"), patch.object(
@@ -132,7 +135,7 @@ def _run_update_until_guard(args):
     ), patch.object(
         cli_main,
         "_detect_venv_python_processes",
-        return_value=[(101, "python.exe", "python.exe -m hermes_cli.main serve")],
+        return_value=holders,
     ), patch.object(
         # Pin the orphan classifier: this test exercises --force/--force-venv
         # gating, not orphan detection (covered in
@@ -163,3 +166,32 @@ def _run_update_until_guard(args):
 def test_venv_holder_guard_force_semantics(force, force_venv, expected, capsys):
     result = _run_update_until_guard(_update_args(force=force, force_venv=force_venv))
     assert result == expected, capsys.readouterr().out
+
+
+def test_venv_holder_guard_never_kills_unverified_foreign_gateway(monkeypatch):
+    import gateway.status as gateway_status
+    import hermes_cli.gateway as hermes_gateway
+
+    gateway_holder = [
+        (
+            808,
+            "python.exe",
+            r"venv\Scripts\python.exe -m hermes_cli.main gateway run",
+        )
+    ]
+    monkeypatch.setattr(
+        hermes_gateway,
+        "_capture_current_install_gateway_argv",
+        lambda pid: None,
+    )
+    monkeypatch.setattr(
+        gateway_status,
+        "terminate_pid",
+        lambda pid, force=False: pytest.fail(
+            f"unverified gateway {pid} was terminated"
+        ),
+    )
+
+    result = _run_update_until_guard(_update_args(), holders=gateway_holder)
+
+    assert result == "exit_2"

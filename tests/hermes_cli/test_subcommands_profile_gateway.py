@@ -61,6 +61,13 @@ def test_gateway_and_proxy_dispatch():
     assert px.func is _h_proxy
 
 
+def test_gateway_install_disabled_flag_parses():
+    ns = _gateway_parser().parse_args(["gateway", "install", "--install-disabled"])
+
+    assert ns.gateway_command == "install"
+    assert ns.install_disabled is True
+
+
 
 
 def test_gateway_enroll_dispatch():

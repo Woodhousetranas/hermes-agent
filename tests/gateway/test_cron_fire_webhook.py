@@ -38,6 +38,15 @@ def adapter():
     return _make_adapter()
 
 
+@pytest.fixture(autouse=True)
+def reset_cron_pause_latch():
+    import cron.jobs as jobs
+
+    jobs._reset_cron_dispatch_pause_latch_for_tests()
+    yield
+    jobs._reset_cron_dispatch_pause_latch_for_tests()
+
+
 class _SpyProvider:
     """Records durable admission and claimed dispatch calls."""
 
@@ -52,6 +61,114 @@ class _SpyProvider:
     def fire_claimed(self, job, *, adapters=None, loop=None):
         self.fired.append(job["id"])
         return True
+
+
+@pytest.mark.asyncio
+async def test_paused_fire_is_retryable_before_legacy_provider_dispatch(
+    adapter, monkeypatch
+):
+    fired = []
+
+    class LegacyProvider:
+        def fire_due(self, job_id, *, adapters=None, loop=None):
+            fired.append(job_id)
+            return True
+
+    monkeypatch.setenv("HERMES_CRON_PAUSED", "true")
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler",
+        lambda: LegacyProvider(),
+    )
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+    )
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer good"},
+            json={"job_id": "abc123"},
+        )
+
+    assert response.status == 503
+    assert response.headers["Retry-After"] == "1"
+    assert fired == []
+    assert adapter.active_agent_work_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_pause_at_worker_admission_is_retryable_not_acked(
+    adapter, monkeypatch
+):
+    import cron.jobs as cron_jobs
+
+    fired = []
+    checks = iter((False, True))
+
+    class LegacyProvider:
+        def fire_due(self, job_id, *, adapters=None, loop=None):
+            fired.append(job_id)
+            return True
+
+    monkeypatch.setattr(
+        cron_jobs,
+        "is_cron_dispatch_paused",
+        lambda: next(checks),
+    )
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler",
+        lambda: LegacyProvider(),
+    )
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+    )
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer good"},
+            json={"job_id": "abc123"},
+        )
+
+    assert response.status == 503
+    assert response.headers["Retry-After"] == "1"
+    assert fired == []
+
+
+@pytest.mark.asyncio
+async def test_pause_engaged_during_split_claim_is_not_reported_as_duplicate(
+    adapter, monkeypatch
+):
+    class PausingProvider(_SpyProvider):
+        def claim_fire(self, job_id):
+            monkeypatch.setenv("HERMES_CRON_PAUSED", "true")
+            return None
+
+    provider = PausingProvider()
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler", lambda: provider
+    )
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+    )
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer good"},
+            json={"job_id": "abc123"},
+        )
+
+    assert response.status == 503
+    assert response.headers["Retry-After"] == "1"
+    assert provider.fired == []
+    assert adapter.active_agent_work_count() == 0
 
 
 @pytest.mark.asyncio

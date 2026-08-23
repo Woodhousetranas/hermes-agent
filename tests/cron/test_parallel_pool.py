@@ -383,14 +383,12 @@ class TestSequentialPool:
         assert sched._sequential_pool is None
 
 
-class TestTickBatchAdvance:
-    """The tick's pre-dispatch advance must go through advance_next_runs
-    exactly once with the whole due set — a revert to the per-job loop
-    (or back to advance_next_run) must fail this test, not slip past the
-    helper-level I/O pin."""
+class TestTickClaimAdvance:
+    """Only the owner-fenced worker claim may consume a recurring due time."""
 
-    def test_tick_calls_advance_next_runs_once_with_all_due_ids(self, tmp_path, monkeypatch):
+    def test_tick_never_batch_advances_before_worker_claim(self, tmp_path, monkeypatch):
         import cron.scheduler as sched
+        import cron.jobs as cron_jobs
 
         sched._parallel_pool = None
         sched._parallel_pool_max_workers = None
@@ -403,20 +401,36 @@ class TestTickBatchAdvance:
             for i in range(4)
         ]
 
-        advance_calls = []
+        claims = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
         monkeypatch.setattr(
-            sched, "advance_next_runs",
-            lambda ids: advance_calls.append(list(ids)) or len(list(ids)))
-        monkeypatch.setattr(sched, "run_job", lambda j, **_kw: (True, "out", "resp", None))
-        monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
-        monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
-        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
+            cron_jobs,
+            "advance_next_runs",
+            lambda *_a, **_kw: pytest.fail(
+                "tick must not consume due times before a worker owns the claim"
+            ),
+        )
+        monkeypatch.setattr(
+            sched,
+            "create_execution",
+            lambda job_id, source: {"id": f"execution-{job_id}"},
+        )
+        monkeypatch.setattr(
+            sched,
+            "claim_job_for_fire",
+            lambda job_id, **kwargs: claims.append((job_id, kwargs))
+            or {
+                **next(job for job in jobs if job["id"] == job_id),
+                "fire_claim": {"by": f"owner-{job_id}", "at": "now"},
+            },
+        )
+        monkeypatch.setattr(sched, "run_one_job", lambda *_a, **_kw: True)
 
         n = sched.tick(verbose=False)
 
         assert n == 4
-        assert advance_calls == [["job-0", "job-1", "job-2", "job-3"]], (
-            f"tick must batch-advance the due set in ONE call; got {advance_calls}")
+        assert claims == [
+            (f"job-{i}", {"return_job": True}) for i in range(4)
+        ]
 
         sched._shutdown_parallel_pool()
