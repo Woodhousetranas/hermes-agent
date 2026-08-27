@@ -287,6 +287,7 @@ def test_run_job_script_uses_explicit_hermes_bash_exe(
     hermes_env, monkeypatch, tmp_path
 ):
     import cron.scheduler as scheduler
+    from tools.environments.local import _bash_safe_path
 
     script = hermes_env / "scripts" / "pinned.sh"
     script.write_text('printf "pinned bash\\n"\n', encoding="utf-8")
@@ -309,7 +310,7 @@ def test_run_job_script_uses_explicit_hermes_bash_exe(
     assert ok is True
     assert output == "pinned bash"
     assert calls[0][0][0] == str(pinned_bash.resolve())
-    assert calls[0][0][1] == str(script.resolve())
+    assert calls[0][0][1] == _bash_safe_path(str(script.resolve()))
 
 
 @pytest.mark.parametrize("configured", ["", "missing/bash.exe"])
@@ -340,10 +341,11 @@ def test_run_job_script_invalid_explicit_bash_fails_without_path_fallback(
     assert "PATH fallback is disabled" in output
 
 
-def test_run_job_script_unset_bash_pin_preserves_path_discovery(
+def test_run_job_script_unset_bash_pin_uses_shared_windows_resolver(
     hermes_env, monkeypatch, tmp_path
 ):
     import cron.scheduler as scheduler
+    import tools.environments.local as local_mod
 
     script = hermes_env / "scripts" / "discovered.sh"
     script.write_text("echo discovered\n", encoding="utf-8")
@@ -353,11 +355,16 @@ def test_run_job_script_unset_bash_pin_preserves_path_discovery(
     monkeypatch.delenv("HERMES_BASH_EXE", raising=False)
     discoveries = []
 
-    def discover(name):
-        discoveries.append(name)
+    def discover():
+        discoveries.append("shared")
         return str(discovered_bash)
 
-    monkeypatch.setattr(scheduler.shutil, "which", discover)
+    monkeypatch.setattr(local_mod, "_find_bash", discover)
+    monkeypatch.setattr(
+        scheduler.shutil,
+        "which",
+        lambda _name: pytest.fail("shared Bash resolver fell back to raw PATH lookup"),
+    )
     calls = []
     monkeypatch.setattr(
         scheduler.subprocess, "Popen", _recording_cron_process(calls)
@@ -367,8 +374,35 @@ def test_run_job_script_unset_bash_pin_preserves_path_discovery(
 
     assert ok is True
     assert output == "pinned bash"
-    assert discoveries == ["bash"]
+    assert discoveries == ["shared"]
     assert calls[0][0][0] == str(discovered_bash)
+
+
+def test_run_job_script_shared_resolver_runtime_error_is_actionable(
+    hermes_env, monkeypatch
+):
+    import cron.scheduler as scheduler
+    import tools.environments.local as local_mod
+
+    (hermes_env / "scripts" / "missing-bash.sh").write_text(
+        "echo should-not-run\n", encoding="utf-8"
+    )
+    monkeypatch.delenv("HERMES_BASH_EXE", raising=False)
+    monkeypatch.setattr(
+        local_mod,
+        "_find_bash",
+        lambda: (_ for _ in ()).throw(RuntimeError("no usable bash")),
+    )
+    monkeypatch.setattr(
+        scheduler.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("unusable WSL bash was executed"),
+    )
+
+    ok, output = scheduler._run_job_script("missing-bash.sh")
+
+    assert ok is False
+    assert "bash not found" in output
 
 
 def test_run_job_shell_script_allows_msys_path_conversion_on_windows(hermes_env, monkeypatch):
