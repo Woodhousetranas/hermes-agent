@@ -3513,21 +3513,34 @@ def _run_job_script(
                 )
             _bash = str(_bash_path)
         else:
-            # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
-            # all work.  On native Windows without Git for Windows installed
-            # shutil.which returns None — fall back to a clear error rather
-            # than a FileNotFoundError with a confusing "[WinError 2]"
-            # traceback.
-            _bash = shutil.which("bash") or (
-                "/bin/bash" if os.path.isfile("/bin/bash") else None
-            )
+            # Resolve bash through the shared, Windows-aware resolver
+            # (portable Git -> Git for Windows -> PATH with a start probe),
+            # so cron jobs never select the System32 WSL launcher when Git
+            # Bash is available. This is the upstream fix for #46332.
+            try:
+                from tools.environments.local import _find_bash
+
+                _bash = _find_bash()
+            except RuntimeError:
+                # On native Windows the only PATH hit may be the unusable WSL
+                # launcher. Surface the clear error below instead of spawning it.
+                _bash = None
+            except Exception:
+                # Preserve the historical fallback for embedded/minimal installs.
+                _bash = shutil.which("bash") or (
+                    "/bin/bash" if os.path.isfile("/bin/bash") else None
+                )
         if _bash is None:
             return False, (
-                f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
+                f"Cannot run .sh/.bash script {path.name!r}: bash not found. "
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
         )
-        argv = [_bash, str(path)]
+        # Git Bash cannot consume a raw C:\\... path reliably; convert it to
+        # the existing MSYS-safe /c/... form. This is the upstream #77393 fix.
+        from tools.environments.local import _bash_safe_path
+
+        argv = [_bash, _bash_safe_path(str(path))]
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)

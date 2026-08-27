@@ -610,14 +610,13 @@ class TestCronSchedulerBashResolution:
     """cron.scheduler must NOT hardcode /bin/bash — .sh scripts need a
     dynamically-resolved bash so Windows (Git Bash) works."""
 
-    def test_source_uses_shutil_which_for_bash(self):
+    def test_source_uses_shared_windows_aware_bash_resolver(self):
         root = Path(__file__).resolve().parents[2]
         source = (root / "cron" / "scheduler.py").read_text(encoding="utf-8")
-        # The old hardcoded path should be gone as the sole bash source.
-        # It may still appear as a POSIX fallback after shutil.which(), so
-        # we check for the shutil.which call near the .sh/.bash branch.
-        assert 'shutil.which("bash")' in source, (
-            "cron.scheduler must resolve bash dynamically via shutil.which"
+        # Raw PATH lookup selects the System32 WSL stub before Git Bash on
+        # native Windows. Cron must use the same probed resolver as tools.
+        assert "from tools.environments.local import _find_bash" in source, (
+            "cron.scheduler must use the shared Windows-aware Bash resolver"
         )
 
     def test_error_message_when_bash_missing(self):
