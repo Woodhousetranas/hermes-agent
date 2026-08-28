@@ -434,6 +434,15 @@ def _load_raw_config() -> Dict[str, Any]:
     return parsed
 
 
+# Skills that must stay available regardless of configuration. The
+# `hermes-agent` skill is the agent's own operating manual — it drives
+# configuring, extending, and troubleshooting Hermes itself, and the system
+# prompt unconditionally points at it. Disabling it leaves the agent unable
+# to help with Hermes, so disable requests for these names are ignored
+# everywhere the disabled list is consulted.
+ESSENTIAL_SKILLS: frozenset = frozenset({"hermes-agent"})
+
+
 def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     """Read disabled skill names from config.yaml.
 
@@ -468,8 +477,10 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
             resolved_platform
         )
         if platform_disabled is not None:
-            return global_disabled | _normalize_string_set(platform_disabled)
-    return global_disabled
+            return (
+                global_disabled | _normalize_string_set(platform_disabled)
+            ) - ESSENTIAL_SKILLS
+    return global_disabled - ESSENTIAL_SKILLS
 
 
 def parse_config_string_list(value) -> List[str]:
@@ -663,9 +674,20 @@ def find_project_root(start: Optional[Path] = None) -> Optional[Path]:
 
     Returns None when cwd is not inside a git checkout. ``.git`` may be a dir
     (normal clone) or a file (worktree/submodule) — both count.
+
+    When *start* is not given, the surface's working directory wins over the
+    process cwd: ``TERMINAL_CWD`` is the same per-surface workdir the terminal
+    tool and cron jobs use (a cron job sets it from its per-job ``workdir``
+    without chdir'ing the scheduler process). This is what lets
+    non-interactive surfaces inherit a prior interactive trust decision by
+    project identity — and a surface with no workdir in a trusted repo simply
+    resolves no project and loads nothing (#48975).
     """
     try:
-        cur = (start or Path.cwd()).resolve()
+        if start is None:
+            env_cwd = os.environ.get("TERMINAL_CWD")
+            start = Path(env_cwd) if env_cwd else Path.cwd()
+        cur = Path(start).resolve()
     except OSError:
         return None
     home = Path.home().resolve()
@@ -791,6 +813,96 @@ def get_scan_ordered_skills_dirs() -> List[Path]:
     dirs.append(get_skills_dir())
     dirs.extend(get_external_skills_dirs())
     return dirs
+
+
+# ── Project skill quarantine (scan-time injection defense) ────────────────
+#
+# Trust (`hermes skills trust`) is a REPO-level decision made once; the repo's
+# skill content keeps changing underneath it with every pull. The hub install
+# path runs skills_guard on install, but project skills are read straight from
+# a checkout — without this gate a `git pull` could inject a malicious skill
+# into an already-trusted repo with no scan anywhere (#48974).
+#
+# Every project SKILL.md's parent dir is scanned with the same skills_guard
+# scanner the hub uses (content-hash cached, so the cost is one scan per
+# skill per content change). A "dangerous" verdict quarantines the skill: it
+# is excluded from the index, skills_list, skill_view, and slash commands.
+# "caution" loads (matches hub behavior for prose-level keyword hits) — the
+# quarantine is for high-confidence findings only.
+#
+# The scan cache lives under HERMES_HOME, never inside the repo (we don't
+# write artifacts into the user's checkout).
+
+_PROJECT_SCAN_SOURCE = "project-local"
+# (skill_dir_resolved) -> quarantined bool, keyed per-process; scan_skill_cached
+# already re-scans on content change via the bundle hash, this only avoids
+# re-reading the attestation JSON on every index/list/view call in one run.
+_PROJECT_QUARANTINE_CACHE: Dict[str, bool] = {}
+
+
+def _project_scan_cache_dir() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "cache" / "project_skill_scans"
+
+
+def is_quarantined_project_skill(skill_md) -> bool:
+    """True when a project skill's scan verdict is ``dangerous``.
+
+    Fail-closed: a scanner crash or missing scanner quarantines the skill
+    (repo-sourced content with no completed scan must not load). Non-project
+    callers should not call this — it scans unconditionally.
+    """
+    skill_dir = Path(skill_md).parent
+    try:
+        key = str(skill_dir.resolve())
+    except OSError:
+        key = str(skill_dir)
+    cached = _PROJECT_QUARANTINE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        from tools.skills_guard import scan_skill_cached
+
+        result, _prov = scan_skill_cached(
+            skill_dir,
+            source=_PROJECT_SCAN_SOURCE,
+            cache_dir=_project_scan_cache_dir(),
+        )
+        quarantined = result.verdict == "dangerous"
+        if quarantined:
+            logger.warning(
+                "Project skill quarantined (verdict=dangerous): %s — %s",
+                skill_dir,
+                result.summary,
+            )
+    except Exception:
+        logger.warning(
+            "Project skill scan failed — quarantining (fail closed): %s",
+            skill_dir,
+            exc_info=True,
+        )
+        quarantined = True
+    _PROJECT_QUARANTINE_CACHE[key] = quarantined
+    return quarantined
+
+
+def _project_quarantine_cache_clear() -> None:
+    """Test hook."""
+    _PROJECT_QUARANTINE_CACHE.clear()
+
+
+def iter_project_skill_files(project_dir: Path):
+    """Yield non-quarantined SKILL.md files under a trusted project dir.
+
+    The single iteration chokepoint for the project tier: every consumer
+    (index, skills_list, slash commands) iterates through here so the
+    quarantine cannot be bypassed by a new call site forgetting the check.
+    """
+    for skill_md in iter_skill_index_files(project_dir, "SKILL.md"):
+        if is_quarantined_project_skill(skill_md):
+            continue
+        yield skill_md
 
 
 def normalize_skill_lookup_name(identifier: str) -> str:

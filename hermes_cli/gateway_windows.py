@@ -130,8 +130,6 @@ _FOLDERID_LOCAL_APPDATA = _GUID(
     0x4FCF,
     (ctypes.c_ubyte * 8)(0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91),
 )
-
-
 def _windows_directory() -> Path:
     """Resolve the Windows directory from Kernel32, never mutable env."""
     _assert_windows()
@@ -212,19 +210,29 @@ def _trusted_windows_child_environment(runtime_path: str) -> dict[str, str]:
     """Return Windows process primitives derived only from OS APIs.
 
     Managed launchers do not inherit mutable ``SystemRoot``, profile, AppData,
-    temp, ComSpec, or hook variables from the shell that staged/started them.
+    ProgramData, temp, ComSpec, or hook variables from the shell that
+    staged/started them.
     """
     windows_dir = _windows_directory()
     profile = _known_folder_path(_FOLDERID_PROFILE, "Profile")
     roaming = _known_folder_path(_FOLDERID_ROAMING_APPDATA, "RoamingAppData")
     local = _known_folder_path(_FOLDERID_LOCAL_APPDATA, "LocalAppData")
+    # SHGetKnownFolderPath(FOLDERID_ProgramData) can return PATH_NOT_FOUND in
+    # the intentionally empty environment used by the managed launcher. The
+    # machine-wide directory is rooted on the OS drive, so derive it from the
+    # already trusted GetWindowsDirectoryW result and require it to exist.
+    program_data = (Path(windows_dir.anchor) / "ProgramData").resolve(strict=True)
+    if not program_data.is_dir():
+        raise RuntimeError(f"ProgramData is not a directory: {program_data}")
     return {
         "SystemRoot": str(windows_dir),
+        "SystemDrive": windows_dir.drive,
         "WINDIR": str(windows_dir),
         "USERPROFILE": str(profile),
         "HOME": str(profile),
         "APPDATA": str(roaming),
         "LOCALAPPDATA": str(local),
+        "ProgramData": str(program_data),
         "TEMP": str(local / "Temp"),
         "TMP": str(local / "Temp"),
         "ComSpec": _stable_system_executable("cmd.exe"),

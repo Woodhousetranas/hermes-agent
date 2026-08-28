@@ -19,6 +19,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path as _Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -339,7 +340,21 @@ class GladlyTelegramApprovalsMixin:
             seen_decisions.add(decision)
 
         if not entries:
-            return content, None
+            # Never expose a signed Portal command as ordinary chat text. If
+            # validation fails, strip the command and its button-only labels
+            # instead of leaking an unusable (or tampered) approval token.
+            cleaned = self._compact_blank_lines(
+                [
+                    line
+                    for line in content.splitlines()
+                    if not _GLADLY_APPROVAL_COMMAND_RE.match(line.strip())
+                    and line.strip() not in _GLADLY_APPROVAL_LABEL_LINES
+                ]
+            )
+            cleaned.append(
+                "Knappar kunde inte skapas säkert. Öppna godkännandet i Portalen."
+            )
+            return "\n".join(cleaned), None
 
         cleaned_lines: List[str] = []
         for line in content.splitlines():
@@ -1032,4 +1047,3 @@ class GladlyTelegramApprovalsMixin:
         if self._bot and chat_id is not None and not edited:
             await self._bot.send_message(chat_id=chat_id, text=final_text[:4000])
         return True
-

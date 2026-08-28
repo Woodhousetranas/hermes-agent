@@ -32,7 +32,7 @@ function runtime() {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__mergeMultiSourceRoster = mergeMultiSourceRoster;\nglobalThis.__botHandle = botHandle;\nglobalThis.__botRosterKey = botRosterKey;\nglobalThis.__botRosterMeta = botRosterMeta;\nglobalThis.__displayName = displayName;\nglobalThis.__filterBots = filterBots;'
+      '\nglobalThis.__mergeMultiSourceRoster = mergeMultiSourceRoster;\nglobalThis.__botHandle = botHandle;\nglobalThis.__botRosterKey = botRosterKey;\nglobalThis.__botRosterMeta = botRosterMeta;\nglobalThis.__displayName = displayName;\nglobalThis.__filterBots = filterBots;\nglobalThis.__resolveRosterMentions = resolveRosterMentions;\nglobalThis.__botConnectionRoute = botConnectionRoute;\nglobalThis.__resolveBotConnectionRoute = resolveBotConnectionRoute;\nglobalThis.__preferReachableSameNameRows = preferReachableSameNameRows;'
     )
   vm.runInNewContext(code, context)
   return context
@@ -230,25 +230,74 @@ test('default rows use source identity without borrowing another source title', 
   const { __botRosterKey: key, __botRosterMeta: metaFor, __displayName: name } = runtime()
   const remote = {
     name: 'default',
-    connectionId: 'personal',
+    connectionId: 'other',
     connectionLabel: 'Personal',
     remoteSource: true,
     sourceScoped: true
   }
-  const active = { ...remote, remoteSource: undefined }
-  const metadata = { default: { title: 'Active workspace' } }
+  const active = { ...remote, connectionId: 'personal', remoteSource: undefined }
+  const metadata = {
+    default: { title: 'Legacy local only' },
+    'personal::default': { title: 'Active workspace' }
+  }
 
-  assert.equal(metaFor(remote, metadata), null)
+  assert.equal(metaFor(remote, metadata), undefined)
   assert.equal(name(remote, metaFor(remote, metadata)), 'Personal')
-  assert.equal(key(remote), 'personal::default')
+  assert.equal(key(remote), 'other::default')
 
   // The ACTIVE gateway's own default is the user's main agent — annotation
   // (sourceScoped + connection fields) must NOT rename it to a connection
   // label. Titled: the title wins. Untitled: it stays "Hermes". Regression:
   // remote-gateway desktops showed the main agent as an IP-derived label
   // with no shortname (Aug 17 2026 report).
-  assert.equal(name(active, metadata.default), 'Active workspace')
+  assert.equal(name(active, metadata['personal::default']), 'Active workspace')
   assert.equal(name(active, undefined), 'Hermes')
+})
+
+test('botRosterMeta: a group roster row orphaned by a deleted connection does not throw', () => {
+  const { __botRosterMeta: metaFor } = runtime()
+  // Mirrors the persisted `group-chats` descriptor left behind once its
+  // connection is removed: remoteSource is still true, but connectionId is
+  // gone, so botConnectionRoute has nothing to resolve. This must not crash
+  // rendering the group (#93492) just because one member is unroutable.
+  const orphaned = { name: 'halakukhan', handle: 'halakukhan', connectionId: null, remoteSource: true }
+
+  assert.doesNotThrow(() => metaFor(orphaned, {}))
+  assert.equal(metaFor(orphaned, {}), null)
+})
+
+test('resolveBotConnectionRoute: typed status for resolved / owner_removed / not_scoped, and strict botConnectionRoute still fails closed', () => {
+  const { __resolveBotConnectionRoute: resolve, __botConnectionRoute: strictRoute } = runtime()
+  const orphaned = { name: 'halakukhan', connectionId: null, remoteSource: true }
+  const owned = { name: 'halakukhan', connectionId: 'conn-1', remoteSource: true }
+  const local = { name: 'default' }
+
+  // Passive resolver: typed status, never throws.
+  assert.equal(resolve(orphaned).status, 'owner_removed')
+  assert.equal(resolve(owned).status, 'resolved')
+  assert.equal(resolve(owned).route.connectionId, 'conn-1')
+  assert.equal(resolve(local).status, 'not_scoped')
+
+  // Strict wrapper used by real dispatch (requestForBot, session creation)
+  // must still fail closed on the same orphaned row -- the split only moves
+  // the *passive* lookup off this throw, it does not remove it.
+  assert.throws(() => strictRoute(orphaned), /has no connection owner/)
+  assert.equal(strictRoute(owned).connectionId, 'conn-1')
+})
+
+test('botRosterMeta: an unrelated failure while resolving meta for a live route still propagates', () => {
+  const { __botRosterMeta: metaFor } = runtime()
+  const owned = { name: 'halakukhan', connectionId: 'conn-1', remoteSource: true }
+  // A metaByName lookup that throws for reasons that have nothing to do with
+  // connection ownership must not be caught by botRosterMeta -- only the
+  // owner_removed status is treated as "no meta for this row".
+  const explodingMetaByName = new Proxy({}, {
+    get() {
+      throw new Error('unrelated invariant failure')
+    }
+  })
+
+  assert.throws(() => metaFor(owned, explodingMetaByName), /unrelated invariant failure/)
 })
 
 test('botHandle: precomputed multi-source handle wins; default stays hermes', () => {
@@ -264,7 +313,14 @@ test('filterBots: matches the source device name for remote rows', () => {
   const { __filterBots: filterBots } = runtime()
   const roster = [
     { name: 'research' },
-    { name: 'research', remoteSource: true, connectionLabel: 'Homelab', handle: 'research-homelab' }
+    {
+      name: 'research',
+      connectionId: 'homelab',
+      connectionLabel: 'Homelab',
+      handle: 'research-homelab',
+      remoteSource: true,
+      sourceScoped: true
+    }
   ]
 
   const hits = filterBots(roster, {}, 'homelab')
@@ -343,6 +399,166 @@ test('merge: primary-local desktop keeps single-source behavior (no phantom rows
 // source's agent, profiles.list answers from THAT source — the merge must
 // classify against the live id, not the registry primary, or the active
 // source's agents duplicate all over again.
+test('merge: live-null local window does not treat registry primary as active', () => {
+  const { __mergeMultiSourceRoster: merge } = runtime()
+  const local = { profiles: [{ name: 'default', last_session: { id: 'this-chat' } }] }
+  const union = {
+    primaryConnectionId: 'spark',
+    agents: [
+      {
+        connectionId: 'local',
+        connectionKind: 'local',
+        connectionLabel: 'This device',
+        profile: 'default',
+        handle: 'default-this-device'
+      },
+      { connectionId: 'spark', connectionKind: 'ssh', connectionLabel: 'Spark', profile: 'bob', handle: 'bob' },
+      { connectionId: 'spark', connectionKind: 'ssh', connectionLabel: 'Spark', profile: 'kai', handle: 'kai' },
+      { connectionId: 'spark', connectionKind: 'ssh', connectionLabel: 'Spark', profile: 'rook', handle: 'rook' }
+    ]
+  }
+
+  // Clicking the local agent leaves host.state.connectionId null while the
+  // registry primary stays on Spark. That must not skip Spark bots or invent
+  // a second "This device" shadow of default.
+  const out = merge(local, union, null)
+
+  assert.equal(out.profiles.filter(p => p.name === 'default').length, 1)
+  assert.equal(out.profiles.find(p => p.name === 'default').last_session.id, 'this-chat')
+  assert.equal(out.profiles.filter(p => p.remoteSource && p.connectionId === 'local').length, 0)
+  assert.equal(
+    out.profiles
+      .filter(p => p.remoteSource)
+      .map(p => p.name)
+      .sort()
+      .join(','),
+    'bob,kai,rook'
+  )
+})
+
+test('merge: legacy remote descriptor infers a matching remote primary when local inventory differs', () => {
+  const { __mergeMultiSourceRoster: merge } = runtime()
+  const local = { profiles: [{ name: 'default', last_session: { id: 'noah-chat' } }] }
+  const union = {
+    primaryConnectionId: 'noah',
+    agents: [
+      { connectionId: 'local', connectionKind: 'local', connectionLabel: 'This device', profile: 'archie', handle: 'archie' },
+      { connectionId: 'noah', connectionKind: 'remote', connectionLabel: 'Noah', profile: 'default', handle: 'default' }
+    ]
+  }
+
+  // Legacy remote descriptors have mode:'remote' but no connectionId, so the
+  // host state is null. The matching primary row must annotate the rich row,
+  // while Archie remains a selectable other-source agent.
+  const out = merge(local, union, null)
+
+  assert.equal(out.profiles.length, 2)
+  assert.equal(out.profiles.find(p => p.name === 'default').connectionId, 'noah')
+  assert.equal(out.profiles.find(p => p.name === 'default').remoteSource, undefined)
+  assert.equal(out.profiles.find(p => p.name === 'archie').connectionId, 'local')
+  assert.equal(out.profiles.find(p => p.name === 'archie').remoteSource, true)
+})
+
+test('merge: previously seen remotes survive a connect-on-demand empty union', () => {
+  const { __mergeMultiSourceRoster: merge } = runtime()
+  const previous = [
+    { name: 'default', last_session: { id: 'this-chat' } },
+    {
+      name: 'bob',
+      remoteSource: true,
+      sourceScoped: true,
+      connectionId: 'spark',
+      connectionKind: 'ssh',
+      connectionLabel: 'Spark',
+      handle: 'bob'
+    }
+  ]
+  const local = { profiles: [{ name: 'default', last_session: { id: 'this-chat' } }] }
+  const union = {
+    primaryConnectionId: 'local',
+    agents: [
+      {
+        connectionId: 'local',
+        connectionKind: 'local',
+        connectionLabel: 'This device',
+        profile: 'default',
+        handle: 'default'
+      }
+    ],
+    sources: [{ connectionId: 'spark', kind: 'ssh', error: 'connect-on-demand' }]
+  }
+
+  const out = merge(local, union, 'local', previous)
+  const bob = out.profiles.find(p => p.name === 'bob' && p.connectionId === 'spark')
+
+  assert.ok(bob)
+  assert.equal(bob.remoteSource, true)
+  assert.equal(out.profiles.filter(p => p.name === 'default').length, 1)
+})
+
+test('merge: previous remotes from a removed connection do not resurrect', () => {
+  const { __mergeMultiSourceRoster: merge } = runtime()
+  const previous = [
+    { name: 'default', last_session: { id: 'this-chat' } },
+    {
+      name: 'bob',
+      remoteSource: true,
+      sourceScoped: true,
+      connectionId: 'gone',
+      connectionKind: 'ssh',
+      connectionLabel: 'Gone',
+      handle: 'bob'
+    }
+  ]
+  const local = { profiles: [{ name: 'default', last_session: { id: 'this-chat' } }] }
+  const union = {
+    primaryConnectionId: 'local',
+    agents: [
+      {
+        connectionId: 'local',
+        connectionKind: 'local',
+        connectionLabel: 'This device',
+        profile: 'default',
+        handle: 'default'
+      }
+    ],
+    sources: [{ connectionId: 'local', kind: 'local' }]
+  }
+
+  const out = merge(local, union, 'local', previous)
+  assert.equal(out.profiles.find(p => p.connectionId === 'gone'), undefined)
+})
+
+test('displayName: local default stays Hermes; remote default uses the device label', () => {
+  const { __displayName: name } = runtime()
+
+  assert.equal(
+    name(
+      {
+        name: 'default',
+        sourceScoped: true,
+        connectionKind: 'local',
+        connectionLabel: 'This device'
+      },
+      null
+    ),
+    'Hermes'
+  )
+  assert.equal(
+    name(
+      {
+        name: 'default',
+        sourceScoped: true,
+        remoteSource: true,
+        connectionKind: 'ssh',
+        connectionLabel: 'Spark'
+      },
+      null
+    ),
+    'Spark'
+  )
+})
+
 test('merge: live active id beats primaryConnectionId for active-source matching', () => {
   const { __mergeMultiSourceRoster: merge } = runtime()
   const local = { profiles: [{ name: 'default', last_session: { id: 's1' } }] }
@@ -365,6 +581,51 @@ test('merge: live active id beats primaryConnectionId for active-source matching
   assert.equal(out.profiles.find(p => p.remoteSource).connectionId, 'local')
 })
 
+// Composition of the two dedup layers (#88828 install_id collapse + #88697
+// boot-descriptor connectionId): when the remote PRIMARY is registered under
+// two addresses, buildAgentRoster collapses the twin to ONE union row that
+// carries the PRIMARY's connectionId (collapse prefers the active/primary
+// connection). The boot descriptor now reports that same id as the live id,
+// so the merge must classify those collapsed rows as active-source
+// annotations — collapse first, then merge, with no re-append and no
+// double-collapse of a genuinely distinct source.
+test('merge: install_id-collapsed twin-address primary composes with the live id (no re-append)', () => {
+  const { __mergeMultiSourceRoster: merge } = runtime()
+  const local = {
+    profiles: [
+      { name: 'default', last_session: { id: 's-default' } },
+      { name: 'dev', last_session: { id: 's-dev' } }
+    ]
+  }
+  const union = {
+    primaryConnectionId: 'spark-lan',
+    agents: [
+      // Post-#88828 union: the tailscale twin of the primary collapsed into
+      // these rows — one per profile, keyed to the PRIMARY connection id.
+      { connectionId: 'spark-lan', connectionKind: 'remote', connectionLabel: 'Spark', profile: 'default', handle: 'default-spark' },
+      { connectionId: 'spark-lan', connectionKind: 'remote', connectionLabel: 'Spark', profile: 'dev', handle: 'dev' },
+      // A real second backend survives the collapse and stays its own row.
+      { connectionId: 'local', connectionKind: 'local', connectionLabel: 'This device', profile: 'default', handle: 'default-this-device' }
+    ]
+  }
+
+  // Live id from the fixed boot descriptor === the collapsed rows' id.
+  const out = merge(local, union, 'spark-lan')
+
+  // 2 annotated primary rows + 1 distinct local row = 3. Pre-fix (live id
+  // null) this was 5: both primary rows re-appended as phantom sources.
+  assert.equal(out.profiles.length, 3)
+  assert.equal(out.profiles.filter(p => p.remoteSource).length, 1)
+
+  const defaultRow = out.profiles.find(p => p.name === 'default' && !p.remoteSource)
+  assert.equal(defaultRow.last_session.id, 's-default')
+  assert.equal(defaultRow.handle, 'default-spark')
+  assert.equal(defaultRow.connectionId, 'spark-lan')
+
+  const localTwin = out.profiles.find(p => p.name === 'default' && p.remoteSource)
+  assert.equal(localTwin.connectionId, 'local')
+})
+
 test('botRosterKey: same name on two sources yields distinct React keys', () => {
   const { __botRosterKey: botRosterKey } = runtime()
 
@@ -376,4 +637,232 @@ test('botRosterKey: same name on two sources yields distinct React keys', () => 
   assert.notEqual(activeRow, remoteRow)
   // Single-source desktops (no connection ids anywhere) keep a stable key.
   assert.equal(legacyRow, 'legacy::default')
+})
+
+test('resolveRosterMentions: @dixie and @bob-mac-mini hit Connections bots, not this chat', () => {
+  const { __resolveRosterMentions: resolve } = runtime()
+  const roster = [
+    { name: 'default', connectionId: 'local', connectionKind: 'local', handle: 'default-this-device' },
+    {
+      name: 'dixie',
+      connectionId: 'mac-mini',
+      connectionKind: 'ssh',
+      connectionLabel: 'Mac Mini',
+      handle: 'dixie',
+      remoteSource: true,
+      sourceScoped: true
+    },
+    {
+      name: 'bob',
+      connectionId: 'mac-mini',
+      connectionKind: 'ssh',
+      connectionLabel: 'Mac Mini',
+      handle: 'bob-mac-mini',
+      remoteSource: true,
+      sourceScoped: true
+    },
+    {
+      name: 'bob',
+      connectionId: 'spark',
+      connectionKind: 'ssh',
+      connectionLabel: 'Spark',
+      handle: 'bob-spark',
+      remoteSource: true,
+      sourceScoped: true
+    }
+  ]
+
+  const hits = resolve('hey @dixie and @bob-spark, ping @bob-mac-mini', roster, {
+    name: 'default',
+    connectionId: 'local'
+  })
+
+  assert.equal(
+    hits
+      .map(bot => `${bot.connectionId}::${bot.name}`)
+      .sort()
+      .join(','),
+    'mac-mini::bob,mac-mini::dixie,spark::bob'
+  )
+})
+
+test('resolveRosterMentions: @hermes in this chat is not a handoff to yourself', () => {
+  const { __resolveRosterMentions: resolve } = runtime()
+  const roster = [
+    { name: 'default', connectionId: 'local', handle: 'hermes' },
+    {
+      name: 'default',
+      connectionId: 'mac-mini',
+      connectionLabel: 'Mac Mini',
+      handle: 'default-mac-mini',
+      remoteSource: true
+    }
+  ]
+
+  const hits = resolve('ask @hermes and @default-mac-mini', roster, {
+    name: 'default',
+    connectionId: 'local'
+  })
+
+  assert.equal(hits.length, 1)
+  assert.equal(hits[0].connectionId, 'mac-mini')
+})
+
+test('source contract: active roster queries use the SDK ambient owner route', () => {
+  assert.doesNotMatch(source, /activeBotRoute/)
+  assert.equal(
+    source.match(/requestForBot\(activeBot, 'profiles\.list', \{\}\)/g)?.length,
+    2,
+    'roster hydration and the session sweep must both use the upstream ambient-owner route'
+  )
+})
+
+test('preferReachableSameNameRows: drops a dead loopback twin when This device is live', () => {
+  const { __preferReachableSameNameRows: prefer } = runtime()
+  const live = {
+    name: 'profile-a',
+    handle: 'profile-a-this-device',
+    connectionId: 'local',
+    connectionKind: 'local',
+    connectionLabel: 'This device',
+    sourceReachable: true
+  }
+  const dead = {
+    name: 'profile-a',
+    handle: 'profile-a-127-0-0-1-19119',
+    connectionId: 'loopback-19119',
+    connectionKind: 'remote',
+    connectionLabel: '127.0.0.1:19119',
+    remoteSource: true,
+    sourceScoped: true,
+    sourceReachable: false
+  }
+  const other = {
+    name: 'profile-b',
+    handle: 'profile-b-127-0-0-1-19119',
+    connectionId: 'loopback-19119',
+    connectionKind: 'remote',
+    connectionLabel: '127.0.0.1:19119',
+    remoteSource: true,
+    sourceScoped: true,
+    sourceReachable: false
+  }
+
+  const out = prefer([dead, live, other])
+
+  assert.equal(out.length, 2)
+  assert.equal(out[0], live)
+  assert.equal(out[1], other)
+})
+
+test('preferReachableSameNameRows: keeps two live sources with the same profile name', () => {
+  const { __preferReachableSameNameRows: prefer } = runtime()
+  const local = {
+    name: 'research',
+    connectionId: 'local',
+    connectionLabel: 'This device',
+    sourceReachable: true
+  }
+  const homelab = {
+    name: 'research',
+    connectionId: 'homelab',
+    connectionLabel: 'Homelab',
+    remoteSource: true,
+    sourceReachable: true
+  }
+
+  const out = prefer([local, homelab])
+
+  assert.equal(out.length, 2)
+  assert.equal(out[0], local)
+  assert.equal(out[1], homelab)
+})
+
+test('preferReachableSameNameRows: keeps an unreachable row when no live twin exists', () => {
+  const { __preferReachableSameNameRows: prefer } = runtime()
+  const dead = {
+    name: 'research',
+    connectionId: 'loopback-19119',
+    sourceReachable: false
+  }
+
+  const out = prefer([dead])
+
+  assert.equal(out.length, 1)
+  assert.equal(out[0], dead)
+})
+
+test('preferReachableSameNameRows: connect-on-demand counts as reachable', () => {
+  const { __preferReachableSameNameRows: prefer } = runtime()
+  const onDemand = {
+    name: 'research',
+    connectionId: 'mac-mini',
+    sourceError: 'connect-on-demand',
+    sourceReachable: false
+  }
+  const dead = {
+    name: 'research',
+    connectionId: 'loopback-19119',
+    sourceReachable: false
+  }
+
+  const out = prefer([onDemand, dead])
+
+  assert.equal(out.length, 1)
+  assert.equal(out[0], onDemand)
+})
+
+test('preferReachableSameNameRows: sourceMissing drops when a live same-name row exists', () => {
+  const { __preferReachableSameNameRows: prefer } = runtime()
+  const live = { name: 'research', connectionId: 'local', sourceReachable: true }
+  const missing = {
+    name: 'research',
+    connectionId: 'gone',
+    sourceMissing: true,
+    sourceReachable: false
+  }
+
+  const out = prefer([missing, live])
+
+  assert.equal(out.length, 1)
+  assert.equal(out[0], live)
+})
+
+test('preferReachableSameNameRows: ghosts stay so a selected offline owner is not replaced', () => {
+  const { __preferReachableSameNameRows: prefer } = runtime()
+  const live = { name: 'research', connectionId: 'local', sourceReachable: true }
+  const ghost = {
+    name: 'research',
+    connectionId: 'loopback-19119',
+    ghost: true,
+    sourceReachable: false
+  }
+
+  const out = prefer([ghost, live])
+
+  assert.equal(out.length, 2)
+  assert.equal(out[0], ghost)
+  assert.equal(out[1], live)
+})
+
+test('preferReachableSameNameRows: does not mutate the input list', () => {
+  const { __preferReachableSameNameRows: prefer } = runtime()
+  const rows = [
+    { name: 'research', connectionId: 'loopback-19119', sourceReachable: false },
+    { name: 'research', connectionId: 'local', sourceReachable: true }
+  ]
+
+  prefer(rows)
+
+  assert.equal(rows.length, 2)
+  assert.equal(rows[0].connectionId, 'loopback-19119')
+})
+
+test('source contract: presentation collapses unreachable twins; shared roster does not', () => {
+  assert.match(source, /preferReachableSameNameRows\(filteredRoster\)/)
+  assert.match(source, /\$lastRoster\.set\(roster\.filter\(row => !row\?\.ghost\)\)/)
+  assert.doesNotMatch(
+    source.slice(source.indexOf('function groupChatMemberBots'), source.indexOf('function durableGroupChatMembers')),
+    /preferReachableSameNameRows/
+  )
 })
