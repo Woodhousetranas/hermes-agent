@@ -19,6 +19,18 @@ import hermes_cli.setup as setup
 _BREAKAWAY_MARKER = "_HERMES_GATEWAY_BREAKAWAY"
 
 
+@pytest.fixture(autouse=True)
+def isolate_managed_install_receipt(monkeypatch):
+    """Gateway unit tests must not depend on a live Gladly release receipt.
+
+    Receipt/manifest binding has its own contract tests. These tests exercise
+    launcher behavior with explicit managed values, so make the embedding
+    detector neutral instead of borrowing whichever checkout happens to run
+    the suite.
+    """
+    monkeypatch.setattr(env_loader, "_managed_install_contract", lambda: None)
+
+
 def _managed_launch_values(runtime_path: str) -> dict[str, str]:
     return {
         "HERMES_GATEWAY_RUNTIME_PATH": runtime_path,
@@ -494,6 +506,10 @@ def test_managed_child_environment_is_from_empty_allowlist(monkeypatch, tmp_path
 
     assert child["PATH"] == runtime_path
     assert child["SystemRoot"] == str(windows_dir)
+    assert child["SystemDrive"] == windows_dir.drive
+    assert child["ProgramData"] == str(
+        (Path(windows_dir.anchor) / "ProgramData").resolve(strict=True)
+    )
     assert child[env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR] == base[
         env_loader._GATEWAY_LAUNCH_ENV_LOCK_VAR
     ]
@@ -1486,6 +1502,9 @@ def test_install_disabled_never_starts_and_registers_disabled(
         gateway_windows, "_assert_no_foreign_startup_collision", lambda: None
     )
     monkeypatch.setattr(
+        gateway_windows, "_assert_no_foreign_task_collision", lambda: None
+    )
+    monkeypatch.setattr(
         gateway_windows,
         "_prompt_install_choices",
         lambda start_now, start_on_login: calls.append(
@@ -2022,6 +2041,9 @@ def test_install_disabled_refuses_startup_folder_fallback(monkeypatch, tmp_path)
     monkeypatch.setattr(
         gateway_windows, "_assert_no_foreign_persistence_collision", lambda: None
     )
+    monkeypatch.setattr(
+        gateway_windows, "_assert_no_foreign_task_collision", lambda: None
+    )
     monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway")
     monkeypatch.setattr(gateway_windows, "_write_task_script", lambda: script_path)
     monkeypatch.setattr(gateway_windows, "_is_running_as_admin", lambda: True)
@@ -2055,6 +2077,9 @@ def test_install_disabled_uac_decline_never_creates_startup_fallback(
     monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
     monkeypatch.setattr(
         gateway_windows, "_assert_no_foreign_persistence_collision", lambda: None
+    )
+    monkeypatch.setattr(
+        gateway_windows, "_assert_no_foreign_task_collision", lambda: None
     )
     monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway")
     monkeypatch.setattr(
@@ -2251,6 +2276,9 @@ def test_install_disabled_uac_unavailable_removes_stale_startup_first(
     monkeypatch.setattr(
         gateway_windows, "_assert_no_foreign_persistence_collision", lambda: None
     )
+    monkeypatch.setattr(
+        gateway_windows, "_assert_no_foreign_task_collision", lambda: None
+    )
     monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway")
     monkeypatch.setattr(
         gateway_windows,
@@ -2301,6 +2329,9 @@ def test_install_disabled_removes_stale_startup_before_uac_handoff(
     monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
     monkeypatch.setattr(
         gateway_windows, "_assert_no_foreign_persistence_collision", lambda: None
+    )
+    monkeypatch.setattr(
+        gateway_windows, "_assert_no_foreign_task_collision", lambda: None
     )
     monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway")
     monkeypatch.setattr(
@@ -2356,6 +2387,9 @@ def test_install_disabled_removes_stale_startup_before_launcher_write(
     monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
     monkeypatch.setattr(
         gateway_windows, "_assert_no_foreign_persistence_collision", lambda: None
+    )
+    monkeypatch.setattr(
+        gateway_windows, "_assert_no_foreign_task_collision", lambda: None
     )
     monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway")
     monkeypatch.setattr(gateway_windows, "get_startup_entry_path", lambda: current)

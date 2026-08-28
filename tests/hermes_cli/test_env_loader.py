@@ -452,6 +452,7 @@ def test_managed_gateway_runtime_requires_validator_confirmed_v3_state(
         "taskEvidenceDigest": f"sha256:{'3' * 64}",
     }
     monkeypatch.setattr(env_loader, "_GATEWAY_START_PROVENANCE", provenance)
+    monkeypatch.setattr(env_loader, "_run_gateway_start_validator_fresh", lambda: None)
     env_loader._assert_gateway_start_provenance_if_managed()
 
 
@@ -817,6 +818,7 @@ def test_managed_gateway_validator_runs_after_dotenv_before_external_sources(
         fake_child_environment,
     )
     monkeypatch.setattr(env_loader, "_validator_file_identity", lambda _path: (1,) * 6)
+    monkeypatch.setattr(env_loader, "_managed_install_contract", lambda: None)
 
     def fake_run(argv, **kwargs):
         events.append("validator")
@@ -877,6 +879,7 @@ def test_managed_gateway_validator_blocks_concurrent_loaders_until_provenance(
         lambda _values: {"PATH": values["PATH"]},
     )
     monkeypatch.setattr(env_loader, "_validator_file_identity", lambda _path: (1,) * 7)
+    monkeypatch.setattr(env_loader, "_managed_install_contract", lambda: None)
 
     validator_entered = threading.Event()
     release_validator = threading.Event()
